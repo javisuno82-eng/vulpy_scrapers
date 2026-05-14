@@ -1,0 +1,112 @@
+name: Scrapers Diarios Supermercados
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+
+  workflow_dispatch:
+    inputs:
+      scraper:
+        description: "Scraper a ejecutar"
+        required: false
+        default: "ambos"
+        type: choice
+        options:
+          - ambos
+          - radarsuper
+          - preciosdelsuper
+      cadena_radar:
+        description: "Cadena RadarSuper (mercadona/carrefour/todas)"
+        required: false
+        default: "todas"
+      test_mode:
+        description: "Modo test"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  scraper-radarsuper:
+    name: RadarSuper (Mercadona + Carrefour)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: >
+      github.event_name == 'schedule' ||
+      github.event.inputs.scraper == 'ambos' ||
+      github.event.inputs.scraper == 'radarsuper'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install requests beautifulsoup4 thefuzz python-dotenv supabase
+
+      - name: Ejecutar scraper RadarSuper
+        env:
+          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
+          CIUDAD_SCRAPER: ${{ vars.CIUDAD_SCRAPER || 'Nacional' }}
+        run: |
+          CADENA="${{ github.event.inputs.cadena_radar || 'todas' }}"
+          TEST="${{ github.event.inputs.test_mode || 'false' }}"
+          CMD="python scraper_radarsuper.py --cadena $CADENA"
+          [ "$TEST" = "true" ] && CMD="$CMD --test"
+          echo "🚀 $CMD" && $CMD
+
+      - name: Subir log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-radarsuper-${{ github.run_id }}
+          path: scraper_radarsuper.log
+          retention-days: 7
+
+  scraper-preciosdelsuper:
+    name: PreciosDelSuper (DIA, Alcampo, Consum...)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: scraper-radarsuper
+    if: >
+      always() && (
+        github.event_name == 'schedule' ||
+        github.event.inputs.scraper == 'ambos' ||
+        github.event.inputs.scraper == 'preciosdelsuper'
+      )
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install requests beautifulsoup4 thefuzz python-dotenv supabase
+
+      - name: Ejecutar scraper PreciosDelSuper
+        env:
+          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
+          CIUDAD_SCRAPER: ${{ vars.CIUDAD_SCRAPER || 'Nacional' }}
+        run: |
+          TEST="${{ github.event.inputs.test_mode || 'false' }}"
+          if [ "$TEST" = "true" ]; then
+            python scraper_preciosdelsuper.py --pages 1 5
+          else
+            python scraper_preciosdelsuper.py
+          fi
+
+      - name: Subir log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-preciosdelsuper-${{ github.run_id }}
+          path: scraper.log
+          retention-days: 7
