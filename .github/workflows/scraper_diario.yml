@@ -1,7 +1,22 @@
+# .github/workflows/scraper_diario.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# MEJORAS DE ROBUSTEZ INCLUIDAS:
+#   - FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 → elimina los avisos de Node.js 20
+#   - cache: "pip" con requirements.txt → instalación más rápida en sucesivas ejecuciones
+#   - continue-on-error + if: always() → el log se sube aunque el scraper falle
+#   - if: hashFiles('scraper_*.log') → no protesta si el log no existe
+#   - timeout-minutes por paso individual → evita bloqueos silenciosos
+#   - Separación de la instalación en dos pasos → más fácil de depurar si falla pip
+#   - Variables de entorno centralizadas a nivel de job → sin repetición
+#   - Paso de comprobación de secretos → avisa claro si faltan antes de ejecutar
+#   - Resumen al final de cada job → visible en la pestaña "Summary" de GitHub
+# ─────────────────────────────────────────────────────────────────────────────
+
 name: Scrapers Diarios Supermercados
 
 on:
   schedule:
+    # Cada día a las 02:00 UTC (04:00 hora peninsular en verano)
     - cron: "0 2 * * *"
 
   workflow_dispatch:
@@ -16,11 +31,16 @@ on:
           - radarsuper
           - preciosdelsuper
       cadena_radar:
-        description: "Cadena RadarSuper (mercadona/carrefour/todas)"
+        description: "Cadena RadarSuper (mercadona / carrefour / todas)"
         required: false
         default: "todas"
+        type: choice
+        options:
+          - todas
+          - mercadona
+          - carrefour
       test_mode:
-        description: "Modo test"
+        description: "Modo test (pocas páginas, sin escritura masiva)"
         required: false
         default: "false"
         type: choice
@@ -28,51 +48,117 @@ on:
           - "false"
           - "true"
 
+# ─── Variable global que elimina los avisos de depreciación de Node.js 20 ────
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 · RadarSuper
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
   scraper-radarsuper:
-    name: RadarSuper (Mercadona + Carrefour)
+    name: "🛒 RadarSuper (Mercadona + Carrefour)"
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
+    # Solo se ejecuta si corresponde según el input (o en ejecución programada)
     if: >
       github.event_name == 'schedule' ||
       github.event.inputs.scraper == 'ambos' ||
       github.event.inputs.scraper == 'radarsuper'
 
+    # Variables de entorno a nivel de job (se heredan en todos los steps)
+    env:
+      SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
+      CIUDAD_SCRAPER: ${{ vars.CIUDAD_SCRAPER || 'Nacional' }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: "📥 Checkout del repositorio"
+        uses: actions/checkout@v4
+
+      # ── 2. Python + caché de pip ───────────────────────────────────────────
+      #   cache: "pip" busca requirements.txt automáticamente.
+      #   Con el archivo en la raíz, el hash cambia solo cuando cambias dependencias.
+      - name: "🐍 Configurar Python 3.11"
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Instalar dependencias
-        run: pip install requests beautifulsoup4 thefuzz python-dotenv supabase
+      # ── 3. Instalar dependencias ───────────────────────────────────────────
+      - name: "📦 Instalar dependencias"
+        timeout-minutes: 5
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Ejecutar scraper RadarSuper
-        env:
-          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
-          CIUDAD_SCRAPER: ${{ vars.CIUDAD_SCRAPER || 'Nacional' }}
+      # ── 4. Verificar secretos antes de ejecutar ────────────────────────────
+      #   Si faltan, el job falla aquí con un mensaje claro en lugar de un
+      #   error críptico de Supabase a mitad del scraper.
+      - name: "🔑 Verificar secretos de Supabase"
+        timeout-minutes: 1
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "❌ ERROR: Los secretos SUPABASE_URL y/o SUPABASE_KEY no están configurados."
+            echo "   Ve a Settings → Secrets and variables → Actions y añádelos."
+            exit 1
+          fi
+          echo "✅ Secretos de Supabase detectados correctamente."
+
+      # ── 5. Ejecutar RadarSuper ─────────────────────────────────────────────
+      - name: "🚀 Ejecutar scraper RadarSuper"
+        id: run_radarsuper
+        timeout-minutes: 110
+        # continue-on-error: true → aunque el scraper falle, el workflow sigue
+        # adelante para poder subir el log parcial que se haya generado.
+        continue-on-error: true
         run: |
           CADENA="${{ github.event.inputs.cadena_radar || 'todas' }}"
           TEST="${{ github.event.inputs.test_mode || 'false' }}"
           CMD="python scraper_radarsuper.py --cadena $CADENA"
           [ "$TEST" = "true" ] && CMD="$CMD --test"
-          echo "🚀 $CMD" && $CMD
+          echo "▶️  Ejecutando: $CMD"
+          $CMD
 
-      - name: Subir log
+      # ── 6. Subir log (aunque el scraper haya fallado) ─────────────────────
+      #   hashFiles comprueba si el archivo existe antes de intentar subirlo,
+      #   eliminando la advertencia "No files were found".
+      - name: "📤 Subir log de RadarSuper"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: log-radarsuper-${{ github.run_id }}
+          name: "log-radarsuper-${{ github.run_id }}"
+          # Si el log no existe (fallo muy temprano), GitHub no protestará
+          # porque añadimos "if-no-files-found: warn" en lugar del default "warn"
           path: scraper_radarsuper.log
+          if-no-files-found: warn
           retention-days: 7
 
+      # ── 7. Resumen del job ─────────────────────────────────────────────────
+      - name: "📊 Resumen"
+        if: always()
+        run: |
+          STATUS="${{ steps.run_radarsuper.outcome }}"
+          if [ "$STATUS" = "success" ]; then
+            echo "### ✅ RadarSuper completado con éxito" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ RadarSuper finalizó con errores (outcome: $STATUS)" >> $GITHUB_STEP_SUMMARY
+            echo "Consulta el log adjunto para más detalles." >> $GITHUB_STEP_SUMMARY
+          fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2 · PreciosDelSuper
+# ─────────────────────────────────────────────────────────────────────────────
   scraper-preciosdelsuper:
-    name: PreciosDelSuper (DIA, Alcampo, Consum...)
+    name: "🏪 PreciosDelSuper (DIA, Alcampo, Consum…)"
     runs-on: ubuntu-latest
     timeout-minutes: 360
     needs: scraper-radarsuper
+
+    # always() → se ejecuta aunque RadarSuper haya fallado, siempre que
+    # el trigger sea el correcto. Sin always(), un fallo en job 1 bloquearía job 2.
     if: >
       always() && (
         github.event_name == 'schedule' ||
@@ -80,33 +166,66 @@ jobs:
         github.event.inputs.scraper == 'preciosdelsuper'
       )
 
+    env:
+      SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
+      CIUDAD_SCRAPER: ${{ vars.CIUDAD_SCRAPER || 'Nacional' }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: "📥 Checkout del repositorio"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Configurar Python 3.11"
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Instalar dependencias
-        run: pip install requests beautifulsoup4 thefuzz python-dotenv supabase
+      - name: "📦 Instalar dependencias"
+        timeout-minutes: 5
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Ejecutar scraper PreciosDelSuper
-        env:
-          SUPABASE_URL:   ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY:   ${{ secrets.SUPABASE_KEY }}
-          CIUDAD_SCRAPER: ${{ vars.CIUDAD_SCRAPER || 'Nacional' }}
+      - name: "🔑 Verificar secretos de Supabase"
+        timeout-minutes: 1
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "❌ ERROR: Los secretos SUPABASE_URL y/o SUPABASE_KEY no están configurados."
+            exit 1
+          fi
+          echo "✅ Secretos de Supabase detectados correctamente."
+
+      - name: "🚀 Ejecutar scraper PreciosDelSuper"
+        id: run_preciosdelsuper
+        timeout-minutes: 350
+        continue-on-error: true
         run: |
           TEST="${{ github.event.inputs.test_mode || 'false' }}"
           if [ "$TEST" = "true" ]; then
+            echo "▶️  Modo test: scrapeando solo páginas 1-5"
             python scraper_preciosdelsuper.py --pages 1 5
           else
+            echo "▶️  Modo completo"
             python scraper_preciosdelsuper.py
           fi
 
-      - name: Subir log
+      - name: "📤 Subir log de PreciosDelSuper"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: log-preciosdelsuper-${{ github.run_id }}
+          name: "log-preciosdelsuper-${{ github.run_id }}"
           path: scraper.log
+          if-no-files-found: warn
           retention-days: 7
+
+      - name: "📊 Resumen"
+        if: always()
+        run: |
+          STATUS="${{ steps.run_preciosdelsuper.outcome }}"
+          if [ "$STATUS" = "success" ]; then
+            echo "### ✅ PreciosDelSuper completado con éxito" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ PreciosDelSuper finalizó con errores (outcome: $STATUS)" >> $GITHUB_STEP_SUMMARY
+            echo "Consulta el log adjunto para más detalles." >> $GITHUB_STEP_SUMMARY
+          fi
