@@ -1,27 +1,28 @@
 """
-scraper_radarsuper.py - Versión Universal
-==========================================
-Scraper para todas las cadenas de radarsuper.com → Supabase
+scraper_radarsuper.py v3 - API Based
+=====================================
+Usa la API interna de radarsuper.com (mucho más robusta que HTML parsing)
 
-Soporta: mercadona, carrefour, dia, alcampo, lidl, etc.
+Estrategia:
+  - Obtiene catálogo de productos desde la API /api/v1/products
+  - Filtra por cadena (Mercadona, Carrefour, etc.)
+  - Mapea categorías automáticamente
+  - Upsert en Supabase sin dependencia de HTML cambiante
 """
 
 from __future__ import annotations
 
 import os
-import re
 import sys
 import time
 import json
 import logging
 import argparse
-import hashlib
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 import requests
-from bs4 import BeautifulSoup
 from thefuzz import fuzz
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -35,20 +36,14 @@ SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
 CIUDAD_SCRAPER = os.getenv("CIUDAD_SCRAPER", "Nacional")
 
-BASE_URL = "https://radarsuper.com"
+BASE_URL = "https://radarsuper.com/api/v1"
 
 FUZZY_THRESHOLD = 72
+SLEEP_ENTRE_REQUESTS = 0.5
+MAX_REINTENTOS = 3
+BACKOFF_BASE = 2.0
 
-SLEEP_PAGINA    = 2.0
-SLEEP_CATEGORIA = 3.0
-SLEEP_PRODUCTO  = 0.1
-
-MAX_REINTENTOS = 4
-BACKOFF_BASE   = 2.0
-
-DIAG_DIR = Path("diagnostico_radarsuper")
-
-# CADENAS SOPORTADAS (se pueden añadir más fácilmente)
+# Mapeo de cadenas
 CADENAS_SOPORTADAS = {
     "mercadona": "Mercadona",
     "carrefour": "Carrefour",
@@ -57,25 +52,73 @@ CADENAS_SOPORTADAS = {
     "lidl": "Lidl",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAPEO DE CATEGORÍAS (slug → categoría en tu app)
-# ─────────────────────────────────────────────────────────────────────────────
+# Mapeo de categorías
 CATEGORIA_MAP = {
-    "aceite-especias-salsas": "condimentos",
-    "aceite-vinagre-sal": "condimentos",
-    "bebe": "higiene",
-    "carne": "carne",
-    "pescado": "pescado",
-    "fruta-verdura": "fruta",
-    "lacteos": "lácteos",
-    "pan": "pan",
-    "congelados": "congelados",
+    "aceite": "condimentos",
+    "especias": "condimentos",
+    "salsas": "condimentos",
+    "agua": "bebidas",
+    "refrescos": "bebidas",
     "bebidas": "bebidas",
+    "cerveza": "bebidas",
+    "vino": "bebidas",
+    "cafe": "bebidas",
+    "te": "bebidas",
+    "zumos": "bebidas",
+    "carne": "carne",
+    "vacuno": "carne",
+    "cerdo": "carne",
+    "pollo": "carne",
+    "aves": "carne",
+    "pescado": "pescado",
+    "marisco": "pescado",
+    "fruta": "fruta",
+    "verdura": "fruta",
+    "lechuga": "fruta",
+    "ensalada": "fruta",
+    "leche": "lácteos",
+    "lacteos": "lácteos",
+    "queso": "lácteos",
+    "yogur": "lácteos",
+    "pan": "pan",
+    "bolleria": "pan",
+    "pasteleria": "pan",
+    "harina": "pan",
+    "congelados": "congelados",
+    "helados": "congelados",
     "snacks": "snacks",
+    "aperitivos": "snacks",
+    "patatas": "snacks",
+    "frutos": "snacks",
     "dulces": "dulces",
+    "chocolate": "dulces",
+    "caramelos": "dulces",
+    "galletas": "galletas",
+    "cereales": "galletas",
     "higiene": "higiene",
+    "jabon": "higiene",
+    "champu": "higiene",
+    "cuidado": "higiene",
+    "desodorante": "higiene",
+    "pañales": "higiene",
+    "toallitas": "higiene",
     "limpieza": "limpieza",
-    # Añade más según vayan apareciendo
+    "detergente": "limpieza",
+    "lejia": "limpieza",
+    "limpiahogar": "limpieza",
+    "papel": "limpieza",
+    "basura": "limpieza",
+    "mascotas": "mascotas",
+    "perro": "mascotas",
+    "gato": "mascotas",
+    "conservas": "conservas",
+    "tomate": "conservas",
+    "atun": "conservas",
+    "sopa": "conservas",
+    "caldo": "conservas",
+    "arroz": "pasta",
+    "pasta": "pasta",
+    "legumbres": "pasta",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,8 +139,8 @@ log = logging.getLogger(__name__)
 # HTTP
 # ─────────────────────────────────────────────────────────────────────────────
 _USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 _ua_index = 0
@@ -110,237 +153,85 @@ def _siguiente_ua() -> str:
     return ua
 
 
-def _crear_sesion() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "Accept-Language": "es-ES,es;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-    })
-    return s
-
-
-_sesion = _crear_sesion()
-
-
-def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
-    global _sesion
+def fetch_json(url: str, params: dict = None) -> Optional[dict]:
+    """Descarga JSON desde la API con reintentos."""
     for intento in range(1, MAX_REINTENTOS + 1):
-        _sesion.headers["User-Agent"] = _siguiente_ua()
         try:
-            r = _sesion.get(url, timeout=30)
+            headers = {"User-Agent": _siguiente_ua()}
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+            
             if r.status_code == 429:
                 time.sleep(BACKOFF_BASE ** intento)
                 continue
+            
             if r.status_code in (502, 503, 504):
                 time.sleep(BACKOFF_BASE ** intento)
-                _sesion = _crear_sesion()
                 continue
+            
             if r.status_code == 404:
-                log.error(f"404 Not Found: {url}")
+                log.warning(f"404 Not Found: {url}")
                 return None
+            
             r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            if diagnostico:
-                _guardar_diagnostico(url, r.text)
-            return soup
+            return r.json()
+            
         except requests.exceptions.RequestException as e:
             log.warning(f"Error en {url} (intento {intento}): {e}")
             time.sleep(BACKOFF_BASE ** intento)
-            _sesion = _crear_sesion()
-    log.error(f"No se pudo descargar {url}")
+    
+    log.error(f"No se pudo descargar {url} tras {MAX_REINTENTOS} intentos")
     return None
 
 
-def _guardar_diagnostico(url: str, html: str):
-    try:
-        DIAG_DIR.mkdir(exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        nombre = hashlib.md5(url.encode()).hexdigest()[:8]
-        path = DIAG_DIR / f"{ts}_{nombre}.html"
-        path.write_text(html, encoding="utf-8")
-        log.warning(f"🔍 HTML guardado: {path}")
-    except Exception:
-        pass
+# ─────────────────────────────────────────────────────────────────────────────
+# API DE RADARSUPER
+# ─────────────────────────────────────────────────────────────────────────────
+def obtener_productos_cadena(cadena_slug: str, page: int = 1, limit: int = 100) -> Optional[dict]:
+    """Obtiene productos de una cadena desde la API."""
+    url = f"{BASE_URL}/products"
+    params = {
+        "chain": cadena_slug,
+        "page": page,
+        "limit": limit,
+    }
+    return fetch_json(url, params=params)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE CATEGORÍAS (automática desde la página principal)
-# ─────────────────────────────────────────────────────────────────────────────
-def extraer_categorias(cadena_slug: str, diagnostico: bool = False) -> list[dict]:
-    """
-    Extrae automáticamente las categorías desde la página principal de la cadena.
-    Ejemplo: https://radarsuper.com/mercadona
-    """
-    url_principal = f"{BASE_URL}/{cadena_slug}"
-    soup = fetch(url_principal, diagnostico=diagnostico)
+def obtener_categorias_cadena(cadena_slug: str) -> list[dict]:
+    """Obtiene todas las categorías de una cadena desde la API."""
+    url = f"{BASE_URL}/chains/{cadena_slug}/categories"
+    data = fetch_json(url)
     
-    if not soup:
-        log.error(f"No se pudo acceder a {url_principal}")
+    if not data or "categories" not in data:
         return []
     
     categorias = []
-    vistos = set()
-    
-    # Patrón para encontrar enlaces de categoría
-    patron = re.compile(rf"/{cadena_slug}/c/([\w-]+)-(\d+)")
-    
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        match = patron.search(href)
-        
-        if not match:
-            continue
-        
-        slug_cat = match.group(1)
-        if slug_cat in vistos:
-            continue
-        
-        texto = a.get_text(strip=True)
-        # Limpiar texto: eliminar contador de productos " (123)"
-        texto_limpio = re.sub(r"\s*\(\d+\)\s*$", "", texto).strip()
-        
-        if not texto_limpio:
-            continue
-        
-        vistos.add(slug_cat)
-        url_categoria = BASE_URL + href if href.startswith("/") else href
+    for cat in data.get("categories", []):
+        slug = cat.get("slug", "")
+        nombre = cat.get("name", "")
         
         # Mapear a categoría de la app
-        cat_app = CATEGORIA_MAP.get(slug_cat, "general")
-        if cat_app == "general":
-            log.info(f"📋 Nueva categoría no mapeada: {slug_cat} → general")
+        cat_app = _mapear_categoria(slug, nombre)
         
         categorias.append({
-            "slug": slug_cat,
-            "nombre": texto_limpio,
-            "url": url_categoria,
+            "slug": slug,
+            "nombre": nombre,
             "cat_app": cat_app,
         })
     
-    if not categorias:
-        log.error(f"No se encontraron categorías para {cadena_slug}")
-        return []
-    
-    log.info(f"  → {len(categorias)} categorías encontradas")
     return categorias
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE PRECIO
-# ─────────────────────────────────────────────────────────────────────────────
-def extraer_precio(texto: str) -> Optional[float]:
-    patrones = [
-        r"(\d{1,4}[.,]\d{2})\s*€",
-        r"€\s*(\d{1,4}[.,]\d{2})",
-        r"(\d{1,4}[.,]\d{2})\s*EUR",
-    ]
-    for patron in patrones:
-        m = re.search(patron, texto, re.IGNORECASE)
-        if m:
-            try:
-                return float(m.group(1).replace(",", "."))
-            except ValueError:
-                continue
-    return None
-
-
-def extraer_precio_kg(texto: str) -> tuple[Optional[float], Optional[str]]:
-    patron = r"(\d{1,4}[.,]\d+)\s*€\s*/\s*(kg|Kg|L|l|ud)"
-    m = re.search(patron, texto, re.IGNORECASE)
-    if m:
-        try:
-            valor = float(m.group(1).replace(",", "."))
-            unidad = m.group(2).lower()
-            return valor, unidad
-        except ValueError:
-            pass
-    return None, None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE PRODUCTOS
-# ─────────────────────────────────────────────────────────────────────────────
-def parsear_productos_pagina(soup: BeautifulSoup, diagnostico: bool = False) -> list[dict]:
-    """Extrae productos de una página de categoría."""
-    productos = []
-    vistos = set()
-    patron_producto = re.compile(r"/p/[\w-]+(?:-\d+)?")
+def _mapear_categoria(slug: str, nombre: str) -> str:
+    """Mapea un slug/nombre de categoría a la categoría de gastos_app."""
+    texto = f"{slug} {nombre}".lower()
     
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not patron_producto.search(href):
-            continue
-        
-        if href in vistos:
-            continue
-        vistos.add(href)
-        
-        # Extraer nombre
-        texto = a.get_text(" ", strip=True)
-        nombre = re.sub(r"\d+[.,]\d+\s*€.*$", "", texto).strip()
-        
-        if not nombre or len(nombre) < 4:
-            # Buscar en elementos cercanos
-            nombre_elem = a.find(["span", "div", "h2", "h3"], 
-                                  class_=re.compile(r"(name|title|nombre)", re.I))
-            if nombre_elem:
-                nombre = nombre_elem.get_text(strip=True)
-        
-        if not nombre or len(nombre) < 4:
-            continue
-        
-        # Extraer precio
-        precio = extraer_precio(texto)
-        if precio is None:
-            padre = a.find_parent(["div", "article", "li"])
-            if padre:
-                precio = extraer_precio(padre.get_text(" ", strip=True))
-        
-        if precio is None:
-            continue
-        
-        # Extraer precio por unidad
-        texto_completo = a.get_text(" ", strip=True)
-        precio_kg, unidad = extraer_precio_kg(texto_completo)
-        
-        url_producto = BASE_URL + href if href.startswith("/") else href
-        
-        productos.append({
-            "nombre": nombre[:150],
-            "precio": precio,
-            "precio_kg": precio_kg,
-            "unidad_precio": unidad,
-            "url": url_producto,
-        })
+    for palabra_clave, categoria in CATEGORIA_MAP.items():
+        if palabra_clave in texto:
+            return categoria
     
-    if not productos and diagnostico:
-        _guardar_diagnostico("productos_no_encontrados", str(soup))
-    
-    return productos
-
-
-def get_total_paginas(soup: BeautifulSoup) -> int:
-    """Detecta el número total de páginas."""
-    max_page = 0
-    for a in soup.find_all("a", href=True):
-        m = re.search(r"[?&]page=(\d+)", a["href"])
-        if m:
-            try:
-                max_page = max(max_page, int(m.group(1)))
-            except ValueError:
-                continue
-    
-    # Buscar texto como "Página 1 de 3"
-    texto = soup.get_text()
-    m = re.search(r"[Pp]ágina\s+\d+\s+de\s+(\d+)", texto)
-    if m:
-        try:
-            max_page = max(max_page, int(m.group(1)))
-        except ValueError:
-            pass
-    
-    return max_page if max_page > 0 else 1
+    log.info(f"📋 Categoría sin mapear: {slug} → {nombre} (usando 'general')")
+    return "general"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -361,13 +252,29 @@ def cargar_tienda(sb: Client, nombre: str) -> Optional[str]:
         return None
 
 
-def cargar_productos(sb: Client) -> list[dict]:
-    try:
-        res = sb.table("productos").select("id, nombre").execute()
-        return res.data
-    except Exception as e:
-        log.error(f"Error cargando productos: {e}")
-        return []
+def cargar_productos(sb: Client, page_size: int = 1000) -> list[dict]:
+    """Carga paginada de productos."""
+    todos = []
+    offset = 0
+    while True:
+        try:
+            res = (
+                sb.table("productos")
+                .select("id, nombre")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = res.data
+            todos.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        except Exception as e:
+            log.error(f"Error cargando productos (offset={offset}): {e}")
+            break
+    
+    log.info(f"📦 {len(todos)} productos cargados")
+    return todos
 
 
 def buscar_producto_fuzzy(nombre: str, productos: list[dict]) -> tuple[Optional[str], int]:
@@ -384,107 +291,139 @@ def buscar_producto_fuzzy(nombre: str, productos: list[dict]) -> tuple[Optional[
     return None, mejor_score
 
 
-def insertar_producto(sb: Client, nombre: str, categoria: str, subcategoria: str, tienda_id: str) -> Optional[str]:
-    try:
-        res = sb.table("productos").insert({
-            "nombre": nombre,
-            "categoria": categoria,
-            "subcategoria": subcategoria,
-            "tienda_origen": tienda_id,
-            "verificado": False
-        }).execute()
-        return res.data[0]["id"] if res.data else None
-    except Exception as e:
-        log.error(f"Error insertando producto: {e}")
-        return None
+def insertar_producto(sb: Client, nombre: str, categoria: str, tienda_id: str) -> Optional[str]:
+    for intento in range(1, 3):
+        try:
+            res = sb.table("productos").insert({
+                "nombre": nombre,
+                "categoria": categoria,
+                "tienda_origen": tienda_id,
+                "verificado": False
+            }).execute()
+            return res.data[0]["id"] if res.data else None
+        except Exception as e:
+            log.error(f"Error insertando producto (intento {intento}): {e}")
+            time.sleep(1)
+    return None
 
 
 def upsert_precio(sb: Client, producto_id: str, tienda_id: str, precio: float):
-    try:
-        sb.table("precios").upsert({
-            "producto_id": producto_id,
-            "tienda_id": tienda_id,
-            "ciudad": CIUDAD_SCRAPER,
-            "precio": precio,
-            "fecha": str(date.today()),
-            "fuente": "radarsuper"
-        }, on_conflict="producto_id,tienda_id,ciudad,fecha").execute()
-    except Exception as e:
-        log.error(f"Error upsert precio: {e}")
+    for intento in range(1, 3):
+        try:
+            sb.table("precios").upsert({
+                "producto_id": producto_id,
+                "tienda_id": tienda_id,
+                "ciudad": CIUDAD_SCRAPER,
+                "precio": precio,
+                "fecha": str(date.today()),
+                "fuente": "radarsuper"
+            }, on_conflict="producto_id,tienda_id,ciudad,fecha").execute()
+            return
+        except Exception as e:
+            log.error(f"Error upsert precio (intento {intento}): {e}")
+            time.sleep(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCRAPER POR CATEGORÍA
+# SCRAPER PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
-def scrape_categoria(
+def scrape_cadena(
     sb: Client,
+    cadena_slug: str,
     cadena_nombre: str,
-    categoria: dict,
     tienda_id: str,
     productos_db: list[dict],
     stats: dict,
     modo_test: bool = False,
-    diagnostico: bool = False,
 ):
-    url_base = categoria["url"]
-    log.info(f"  📂 {categoria['nombre']} [{categoria['cat_app']}]")
-
-    soup = fetch(url_base, diagnostico=diagnostico)
-    if not soup:
-        stats["categorias_error"] += 1
+    """Scraper de una cadena completa."""
+    log.info(f"\n🏪 Procesando {cadena_nombre} ({cadena_slug})...")
+    
+    # Obtener categorías
+    categorias = obtener_categorias_cadena(cadena_slug)
+    if not categorias:
+        log.error(f"No se encontraron categorías para {cadena_nombre}")
         return
-
-    total_pags = 1 if modo_test else get_total_paginas(soup)
-    log.info(f"     Páginas: {total_pags}")
-
-    for page_num in range(1, total_pags + 1):
-        url = f"{url_base}?page={page_num}" if page_num > 1 else url_base
-        soup_pag = soup if page_num == 1 else fetch(url, diagnostico=diagnostico)
+    
+    log.info(f"  → {len(categorias)} categorías encontradas")
+    
+    if modo_test:
+        categorias = categorias[:3]
+        log.info(f"Modo test: {len(categorias)} categorías")
+    
+    # Procesar cada categoría
+    for i, categoria in enumerate(categorias, 1):
+        log.info(f"\n  [{i}/{len(categorias)}] {categoria['nombre']}")
         
-        if not soup_pag:
-            stats["paginas_error"] += 1
-            continue
-
-        items = parsear_productos_pagina(soup_pag, diagnostico=diagnostico)
-        log.info(f"     Página {page_num}/{total_pags} → {len(items)} productos")
-
-        for item in items:
-            stats["procesados"] += 1
-
-            if not item["nombre"] or item["precio"] is None:
-                stats["sin_precio"] += 1
-                continue
-
-            producto_id, score = buscar_producto_fuzzy(item["nombre"], productos_db)
-
-            if producto_id:
-                stats["actualizados"] += 1
-                log.debug(f"Match ({score}%): '{item['nombre']}'")
-            else:
-                log.info(f"Nuevo producto: '{item['nombre']}' (score: {score}%)")
-                producto_id = insertar_producto(
-                    sb, item["nombre"], categoria["cat_app"], categoria["nombre"], tienda_id
-                )
-                if not producto_id:
-                    stats["errores_db"] += 1
+        page = 1
+        total_categoria = 0
+        
+        while True:
+            # Obtener productos de esta categoría
+            data = obtener_productos_cadena(cadena_slug, page=page)
+            
+            if not data or "products" not in data:
+                break
+            
+            productos = data.get("products", [])
+            if not productos:
+                break
+            
+            log.info(f"     Página {page} → {len(productos)} productos")
+            
+            for item in productos:
+                stats["procesados"] += 1
+                total_categoria += 1
+                
+                nombre = item.get("name", "").strip()
+                precio = item.get("price")
+                
+                if not nombre or precio is None:
+                    stats["sin_precio"] += 1
                     continue
-                productos_db.append({"id": producto_id, "nombre": item["nombre"]})
-                stats["nuevos"] += 1
-
-            upsert_precio(sb, producto_id, tienda_id, item["precio"])
-            time.sleep(SLEEP_PRODUCTO)
-
-        time.sleep(SLEEP_PAGINA)
+                
+                try:
+                    precio = float(precio)
+                except (ValueError, TypeError):
+                    stats["sin_precio"] += 1
+                    continue
+                
+                # Fuzzy match
+                producto_id, score = buscar_producto_fuzzy(nombre, productos_db)
+                
+                if producto_id:
+                    stats["actualizados"] += 1
+                    log.debug(f"Match ({score}%): '{nombre}'")
+                else:
+                    log.info(f"Nuevo producto: '{nombre}' (score: {score}%)")
+                    producto_id = insertar_producto(sb, nombre, categoria["cat_app"], tienda_id)
+                    if not producto_id:
+                        stats["errores_db"] += 1
+                        continue
+                    productos_db.append({"id": producto_id, "nombre": nombre})
+                    stats["nuevos"] += 1
+                
+                upsert_precio(sb, producto_id, tienda_id, precio)
+                time.sleep(0.1)
+            
+            page += 1
+            time.sleep(SLEEP_ENTRE_REQUESTS)
+            
+            # En modo test, solo 1 página por categoría
+            if modo_test:
+                break
+        
+        log.info(f"     Total categoría: {total_categoria} productos")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-def main(cadena_seleccionada: Optional[str] = None, modo_test: bool = False, diagnostico: bool = False):
+def main(cadena_seleccionada: Optional[str] = None, modo_test: bool = False):
     inicio_ts = datetime.now()
-    log.info("=" * 65)
-    log.info(f"🛒 Scraper RadarSuper Universal — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
-    log.info("=" * 65)
+    log.info("=" * 70)
+    log.info(f"🛒 Scraper RadarSuper v3 (API) — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info("=" * 70)
 
     try:
         sb = get_supabase()
@@ -493,77 +432,57 @@ def main(cadena_seleccionada: Optional[str] = None, modo_test: bool = False, dia
         log.error(f"❌ {e}")
         sys.exit(1)
 
-    # Determinar qué cadenas procesar
+    # Determinar cadenas a procesar
     if cadena_seleccionada and cadena_seleccionada != "todas":
         if cadena_seleccionada not in CADENAS_SOPORTADAS:
-            log.error(f"❌ Cadena '{cadena_seleccionada}' no soportada. Opciones: {list(CADENAS_SOPORTADAS.keys())}")
+            log.error(f"❌ Cadena no soportada: {cadena_seleccionada}")
             sys.exit(1)
-        cadenas_a_procesar = {cadena_seleccionada: CADENAS_SOPORTADAS[cadena_seleccionada]}
+        cadenas = {cadena_seleccionada: CADENAS_SOPORTADAS[cadena_seleccionada]}
     else:
-        cadenas_a_procesar = CADENAS_SOPORTADAS
+        cadenas = CADENAS_SOPORTADAS
 
     productos_globales = cargar_productos(sb)
     
-    stats_globales = {
-        "procesados": 0, "actualizados": 0, "nuevos": 0,
-        "sin_precio": 0, "errores_db": 0, "paginas_error": 0, "categorias_error": 0
+    stats = {
+        "procesados": 0,
+        "actualizados": 0,
+        "nuevos": 0,
+        "sin_precio": 0,
+        "errores_db": 0,
     }
 
-    for cadena_slug, cadena_nombre in cadenas_a_procesar.items():
-        log.info(f"\n🏪 Procesando {cadena_nombre} ({cadena_slug})...")
-        
+    for cadena_slug, cadena_nombre in cadenas.items():
         tienda_id = cargar_tienda(sb, cadena_nombre)
         if not tienda_id:
-            log.warning(f"⚠️ Tienda '{cadena_nombre}' no encontrada en Supabase. Saltando.")
+            log.warning(f"⚠️ Tienda '{cadena_nombre}' no encontrada en Supabase")
             continue
 
-        categorias = extraer_categorias(cadena_slug, diagnostico=diagnostico)
-        if not categorias:
-            log.error(f"No se encontraron categorías para {cadena_nombre}")
-            continue
-
-        if modo_test:
-            categorias = categorias[:3]
-            log.info(f"Modo test: {len(categorias)} categorías")
-
-        for i, categoria in enumerate(categorias, 1):
-            log.info(f"\n  [{i}/{len(categorias)}] {categoria['nombre']}")
-            scrape_categoria(
-                sb, cadena_nombre, categoria, tienda_id, productos_globales,
-                stats_globales, modo_test, diagnostico
-            )
-            time.sleep(SLEEP_CATEGORIA)
+        scrape_cadena(sb, cadena_slug, cadena_nombre, tienda_id, productos_globales, stats, modo_test)
 
     duracion = datetime.now() - inicio_ts
-    log.info("=" * 65)
+    log.info("=" * 70)
     log.info(f"✅ Scraper finalizado en {duracion}")
-    log.info(f"   Productos procesados: {stats_globales['procesados']}")
-    log.info(f"   Precios actualizados: {stats_globales['actualizados']}")
-    log.info(f"   Productos nuevos: {stats_globales['nuevos']}")
-    log.info(f"   Sin precio: {stats_globales['sin_precio']}")
-    log.info(f"   Errores DB: {stats_globales['errores_db']}")
-    log.info(f"   Páginas error: {stats_globales['paginas_error']}")
-    log.info(f"   Categorías error: {stats_globales['categorias_error']}")
-    log.info("=" * 65)
+    log.info(f"   Productos procesados: {stats['procesados']}")
+    log.info(f"   Precios actualizados: {stats['actualizados']}")
+    log.info(f"   Productos nuevos: {stats['nuevos']}")
+    log.info(f"   Sin precio: {stats['sin_precio']}")
+    log.info(f"   Errores DB: {stats['errores_db']}")
+    log.info("=" * 70)
 
     # Guardar resumen
     try:
         Path("scraper_radarsuper_resumen.json").write_text(
-            json.dumps({"fecha": str(date.today()), "duracion": str(duracion), **stats_globales}, indent=2)
+            json.dumps({"fecha": str(date.today()), "duracion": str(duracion), **stats}, indent=2)
         )
     except Exception:
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scraper RadarSuper Universal")
-    parser.add_argument("--cadena", choices=list(CADENAS_SOPORTADAS.keys()) + ["todas"], 
+    parser = argparse.ArgumentParser(description="Scraper RadarSuper v3 (API Based)")
+    parser.add_argument("--cadena", choices=list(CADENAS_SOPORTADAS.keys()) + ["todas"],
                         default="todas", help="Cadena a procesar")
-    parser.add_argument("--test", action="store_true", help="Modo test (3 categorías, 1 página)")
-    parser.add_argument("--diagnostico", action="store_true", help="Guardar HTML para depuración")
+    parser.add_argument("--test", action="store_true", help="Modo test")
     args = parser.parse_args()
 
-    main(cadena_seleccionada=args.cadena, modo_test=args.test, diagnostico=args.diagnostico)
+    main(cadena_seleccionada=args.cadena, modo_test=args.test)
