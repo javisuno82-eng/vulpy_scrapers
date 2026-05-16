@@ -362,28 +362,45 @@ def _limpiar_nombre(nombre: str) -> str:
 # EXTRACCIÓN DE CATEGORÍAS — múltiples patrones de URL
 # ─────────────────────────────────────────────────────────────────────────────
 # Patrones de URL de categoría ordenados de más a menos específico.
-# Si RadarSuper cambia su estructura de URLs, los siguientes actúan de fallback.
+# RadarSuper usa actualmente: /fitoterapia/c/fitoterapia-213
+# Es decir: /{categoria_slug}/c/{categoria_slug}-{id}
+# El slug de cadena NO aparece en la URL de categoría.
 _PATRONES_CATEGORIA_URL = [
-    r"/([\w-]+)/c/([\w-]+)-(\d+)",     # /mercadona/c/aceite-especias-salsas-123
-    r"/([\w-]+)/categoria/([\w-]+)",   # /mercadona/categoria/aceite-especias
-    r"/([\w-]+)/([\w-]+)/productos",   # /mercadona/aceite-especias/productos
-    r"/c/([\w-]+)-(\d+)",              # /c/aceite-especias-123 (sin cadena en URL)
-    r"/categorias/([\w-]+)",           # /categorias/aceite-especias
+    r"/([\w-]+)/c/([\w-]+)-(\d+)",     # /fitoterapia/c/fitoterapia-213 (estructura actual)
+    r"/([\w-]+)/c/([\w-]+)",           # /fitoterapia/c/fitoterapia (sin ID numérico)
+    r"/([\w-]+)/categoria/([\w-]+)",   # /fitoterapia/categoria/fitoterapia
+    r"/([\w-]+)/productos/([\w-]+)",   # /fitoterapia/productos/lista
+    r"/c/([\w-]+)-(\d+)",              # /c/fitoterapia-213 (sin prefijo)
+    r"/categorias/([\w-]+)",           # /categorias/fitoterapia
 ]
 
 
 def extraer_categorias(cadena_slug: str, diagnostico: bool = False) -> list[dict]:
     """
     Extrae todas las categorías del catálogo de una cadena.
-    Prueba múltiples patrones de URL si el principal falla.
+    Prueba múltiples URLs de entrada y patrones si el principal falla.
     """
-    url = f"{BASE_URL}/{cadena_slug}"
-    soup = fetch(url, diagnostico=diagnostico)
+    urls_entrada = [
+        f"{BASE_URL}/{cadena_slug}",
+        f"{BASE_URL}/{cadena_slug}/productos",
+        f"{BASE_URL}/supermercado/{cadena_slug}",
+        f"{BASE_URL}/cadena/{cadena_slug}",
+    ]
+
+    soup = None
+    url_usada = ""
+    for url in urls_entrada:
+        s = fetch(url, diagnostico=diagnostico)
+        if s and not _parece_vacia(s):
+            soup = s
+            url_usada = url
+            log.info(f"  → Entrada al catálogo: {url}")
+            break
+
     if not soup:
-        log.error(f"No se pudo acceder a {url}")
+        log.error(f"No se pudo acceder al catálogo de {cadena_slug}")
         return []
 
-    # Probar patrones en orden hasta encontrar categorías
     for patron_str in _PATRONES_CATEGORIA_URL:
         patron = re.compile(patron_str)
         categorias = _extraer_categorias_con_patron(soup, patron, cadena_slug)
@@ -391,13 +408,12 @@ def extraer_categorias(cadena_slug: str, diagnostico: bool = False) -> list[dict
             log.info(f"  → {len(categorias)} categorías encontradas (patrón: {patron_str})")
             return categorias
 
-    # Último recurso: buscar cualquier link que contenga el slug de la cadena
     log.warning(
         f"⚠️  CAMBIO ESTRUCTURAL: no se detectaron categorías con los patrones conocidos "
         f"para '{cadena_slug}'. Intentando extracción genérica..."
     )
     if diagnostico:
-        _guardar_diagnostico(url, str(soup))
+        _guardar_diagnostico(url_usada, str(soup))
 
     return _extraer_categorias_generico(soup, cadena_slug)
 
@@ -418,25 +434,32 @@ def _extraer_categorias_con_patron(
         if not m:
             continue
 
-        # El slug de categoría está en el primer grupo con guiones
-        grupos = [g for g in m.groups() if g and "-" in g or len(g) > 3]
+        grupos = [g for g in m.groups() if g and not g.isdigit()]
         if not grupos:
             continue
 
-        slug_cat = grupos[0] if grupos[0] != cadena_slug else (grupos[1] if len(grupos) > 1 else grupos[0])
-        nombre   = a.get_text(strip=True)
-        nombre   = re.sub(r"\d+$", "", nombre).strip()  # quitar conteo "42"
+        # El slug de categoría es el grupo más largo que no sea el slug de cadena
+        slug_cat = None
+        for g in reversed(grupos):
+            if g and g != cadena_slug and len(g) >= 3:
+                slug_cat = g
+                break
+        if not slug_cat:
+            slug_cat = grupos[-1]
+
+        nombre = a.get_text(strip=True)
+        nombre = re.sub(r"\d+$", "", nombre).strip()
 
         if not nombre or len(nombre) < 3:
             continue
-        if slug_cat == cadena_slug:
+
+        # Excluir links que no son categorías de productos
+        if any(x in href for x in ["/p/", "/m/", "/blog/", "/tiendas/"]):
             continue
 
         vistos.add(href)
 
-        # Resolver categoría en gastos_app
         cat_app = _resolver_categoria(slug_cat)
-
         url_completa = (BASE_URL + href) if href.startswith("/") else href
 
         categorias.append({
