@@ -430,31 +430,44 @@ def _extraer_categorias_con_patron(
         if href in vistos:
             continue
 
+        # Excluir links que no son de categoría
+        if any(x in href for x in ["/p/", "/m/", "/blog/", "/tiendas/", "?", "#"]):
+            continue
+
         m = patron.search(href)
         if not m:
             continue
 
-        grupos = [g for g in m.groups() if g and not g.isdigit()]
+        # El patrón devuelve grupos. Para /{cadena}/c/{slug}-{id}:
+        # Grupos: ('mercadona', 'aceite-especias-salsas', '12')
+        # Queremos el penúltimo (slug antes del ID)
+        grupos = m.groups()
         if not grupos:
             continue
 
-        # El slug de categoría es el grupo más largo que no sea el slug de cadena
-        slug_cat = None
-        for g in reversed(grupos):
-            if g and g != cadena_slug and len(g) >= 3:
-                slug_cat = g
-                break
-        if not slug_cat:
-            slug_cat = grupos[-1]
+        # Si el primer grupo es la cadena (ej: 'mercadona'), el slug es el segundo
+        # Si no, el slug es el primero o el penúltimo según el patrón
+        if grupos[0] == cadena_slug:
+            # Patrón: /{cadena}/c/{slug}-{id}
+            slug_cat = grupos[1] if len(grupos) > 1 else grupos[0]
+        else:
+            # Patrón sin cadena: /c/{slug}-{id} o /{slug}/c/{slug}...
+            # Tomar el penúltimo si es texto, el último si no es número
+            slug_cat = None
+            for g in reversed(grupos):
+                if g and not g.isdigit() and len(g) >= 3:
+                    slug_cat = g
+                    break
+            if not slug_cat:
+                slug_cat = grupos[0] if grupos else ""
+
+        if not slug_cat or len(slug_cat) < 3:
+            continue
 
         nombre = a.get_text(strip=True)
         nombre = re.sub(r"\d+$", "", nombre).strip()
 
         if not nombre or len(nombre) < 3:
-            continue
-
-        # Excluir links que no son categorías de productos
-        if any(x in href for x in ["/p/", "/m/", "/blog/", "/tiendas/"]):
             continue
 
         vistos.add(href)
@@ -1015,18 +1028,3 @@ if __name__ == "__main__":
         modo_test=args.test,
         diagnostico=args.diagnostico,
     )
-- name: "🔍 Test HTML RadarSuper"
-  run: |
-    python3 - << 'EOF'
-    import requests
-    r = requests.get("https://radarsuper.com/mercadona", headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    })
-    print(f"Status: {r.status_code}")
-    print(f"Tamaño HTML: {len(r.text)} caracteres")
-    # Buscar links de categoría
-    import re
-    cats = re.findall(r'/mercadona/c/[\w-]+', r.text)
-    print(f"Categorías encontradas en HTML: {len(cats)}")
-    print("Primeras 5:", cats[:5])
-    EOF
