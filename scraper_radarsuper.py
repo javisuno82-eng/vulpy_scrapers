@@ -1015,3 +1015,18 @@ if __name__ == "__main__":
         modo_test=args.test,
         diagnostico=args.diagnostico,
     )
+- name: "🔍 Test HTML RadarSuper"
+  run: |
+    python3 - << 'EOF'
+    import requests
+    r = requests.get("https://radarsuper.com/mercadona", headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    })
+    print(f"Status: {r.status_code}")
+    print(f"Tamaño HTML: {len(r.text)} caracteres")
+    # Buscar links de categoría
+    import re
+    cats = re.findall(r'/mercadona/c/[\w-]+', r.text)
+    print(f"Categorías encontradas en HTML: {len(cats)}")
+    print("Primeras 5:", cats[:5])
+    EOF
