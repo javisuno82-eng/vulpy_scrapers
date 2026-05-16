@@ -10,6 +10,7 @@
 #   - Variables de entorno centralizadas a nivel de job → sin repetición
 #   - Paso de comprobación de secretos → avisa claro si faltan antes de ejecutar
 #   - Resumen al final de cada job → visible en la pestaña "Summary" de GitHub
+#   - Instalación de Chrome para undetected-chromedriver
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Scrapers Diarios Supermercados
@@ -79,24 +80,30 @@ jobs:
         uses: actions/checkout@v4
 
       # ── 2. Python + caché de pip ───────────────────────────────────────────
-      #   cache: "pip" busca requirements.txt automáticamente.
-      #   Con el archivo en la raíz, el hash cambia solo cuando cambias dependencias.
       - name: "🐍 Configurar Python 3.11"
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # ── 3. Instalar dependencias ───────────────────────────────────────────
-      - name: "📦 Instalar dependencias"
+      # ── 3. Instalar Google Chrome (necesario para undetected-chromedriver) ──
+      - name: "🌐 Instalar Google Chrome"
+        timeout-minutes: 5
+        run: |
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      # ── 4. Instalar dependencias de Python ─────────────────────────────────
+      - name: "📦 Instalar dependencias Python"
         timeout-minutes: 5
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. Verificar secretos antes de ejecutar ────────────────────────────
-      #   Si faltan, el job falla aquí con un mensaje claro en lugar de un
-      #   error críptico de Supabase a mitad del scraper.
+      # ── 5. Verificar secretos antes de ejecutar ────────────────────────────
       - name: "🔑 Verificar secretos de Supabase"
         timeout-minutes: 1
         run: |
@@ -107,12 +114,10 @@ jobs:
           fi
           echo "✅ Secretos de Supabase detectados correctamente."
 
-      # ── 5. Ejecutar RadarSuper ─────────────────────────────────────────────
+      # ── 6. Ejecutar RadarSuper ─────────────────────────────────────────────
       - name: "🚀 Ejecutar scraper RadarSuper"
         id: run_radarsuper
         timeout-minutes: 110
-        # continue-on-error: true → aunque el scraper falle, el workflow sigue
-        # adelante para poder subir el log parcial que se haya generado.
         continue-on-error: true
         run: |
           CADENA="${{ github.event.inputs.cadena_radar || 'todas' }}"
@@ -122,21 +127,37 @@ jobs:
           echo "▶️  Ejecutando: $CMD"
           $CMD
 
-      # ── 6. Subir log (aunque el scraper haya fallado) ─────────────────────
-      #   hashFiles comprueba si el archivo existe antes de intentar subirlo,
-      #   eliminando la advertencia "No files were found".
+      # ── 7. Subir diagnóstico (HTMLs guardados) ─────────────────────────────
+      - name: "📤 Subir diagnóstico HTML"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "diagnostico-radarsuper-${{ github.run_id }}"
+          path: diagnostico_radarsuper/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ── 8. Subir log de RadarSuper ─────────────────────────────────────────
       - name: "📤 Subir log de RadarSuper"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: "log-radarsuper-${{ github.run_id }}"
-          # Si el log no existe (fallo muy temprano), GitHub no protestará
-          # porque añadimos "if-no-files-found: warn" en lugar del default "warn"
           path: scraper_radarsuper.log
           if-no-files-found: warn
           retention-days: 7
 
-      # ── 7. Resumen del job ─────────────────────────────────────────────────
+      # ── 9. Subir resumen JSON ──────────────────────────────────────────────
+      - name: "📤 Subir resumen JSON"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "resumen-radarsuper-${{ github.run_id }}"
+          path: scraper_radarsuper_resumen.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ── 10. Resumen del job ────────────────────────────────────────────────
       - name: "📊 Resumen"
         if: always()
         run: |
@@ -157,8 +178,6 @@ jobs:
     timeout-minutes: 360
     needs: scraper-radarsuper
 
-    # always() → se ejecuta aunque RadarSuper haya fallado, siempre que
-    # el trigger sea el correcto. Sin always(), un fallo en job 1 bloquearía job 2.
     if: >
       always() && (
         github.event_name == 'schedule' ||
