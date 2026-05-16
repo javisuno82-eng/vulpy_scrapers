@@ -3,8 +3,11 @@ scraper_radarsuper.py
 =====================
 Scraper diario de radarsuper.com → Supabase (gastos_app)
 
-MEJORAS DE ROBUSTEZ v2:
-  - Múltiples estrategias de extracción con fallback automático
+MEJORAS DE ROBUSTEZ v3:
+  - Actualizado para nueva estructura de RadarSuper (mayo 2026)
+  - Múltiples estrategias de extracción de categorías adaptadas al nuevo diseño
+  - Soporte para URLs /supermercado/{cadena}
+  - Extracción mejorada de productos con nuevos selectores
   - Reintentos con backoff exponencial (red + HTTP 429/503)
   - Rotación de User-Agent para evitar bloqueos
   - Detección de cambios estructurales en la página con alertas en el log
@@ -79,8 +82,9 @@ DIAG_DIR = Path("diagnostico_radarsuper")
 CADENAS: dict[str, str] = {
     "mercadona": "Mercadona",
     "carrefour": "Carrefour",
-    # "lidl":      "Lidl",     # descomentar cuando RadarSuper los añada
-    # "alcampo":   "Alcampo",
+    "dia":       "Dia",
+    "alcampo":   "Alcampo",
+    "lidl":      "Lidl",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,6 +157,8 @@ _USER_AGENTS = [
     ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"),
     ("Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"),
+    ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15"),
 ]
 _ua_index = 0
 
@@ -171,6 +177,7 @@ def _crear_sesion() -> requests.Session:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
     })
     return s
 
@@ -188,7 +195,8 @@ def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
     for intento in range(1, MAX_REINTENTOS + 1):
         _sesion.headers["User-Agent"] = _siguiente_ua()
         try:
-            r = _sesion.get(url, timeout=20)
+            log.debug(f"Fetching {url} (intento {intento})")
+            r = _sesion.get(url, timeout=30)
 
             if r.status_code == 429:
                 espera = float(r.headers.get("Retry-After", BACKOFF_BASE ** intento))
@@ -203,18 +211,24 @@ def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
                 _sesion = _crear_sesion()
                 continue
 
+            if r.status_code == 403:
+                log.warning(f"HTTP 403 en {url} — puede que hayamos sido bloqueados")
+                if diagnostico:
+                    _guardar_diagnostico(url, r.text)
+                return None
+
             r.raise_for_status()
 
             soup = BeautifulSoup(r.text, "html.parser")
 
-            if diagnostico or _parece_vacia(soup):
+            if diagnostico and _parece_vacia(soup):
                 _guardar_diagnostico(url, r.text)
 
             return soup
 
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.ConnectionError as e:
             espera = BACKOFF_BASE ** intento
-            log.warning(f"Error de conexión en {url} (intento {intento}/{MAX_REINTENTOS}) — reintentando en {espera:.0f}s")
+            log.warning(f"Error de conexión en {url} (intento {intento}/{MAX_REINTENTOS}): {e}")
             time.sleep(espera)
             _sesion = _crear_sesion()
 
@@ -235,7 +249,7 @@ def _parece_vacia(soup: BeautifulSoup) -> bool:
     texto = soup.get_text(strip=True)
     if len(texto) < 200:
         return True
-    alertas = ["acceso restringido", "captcha", "403", "503", "error interno", "access denied"]
+    alertas = ["acceso restringido", "captcha", "403", "503", "error interno", "access denied", "cloudflare"]
     return any(a in texto.lower() for a in alertas)
 
 
@@ -259,6 +273,7 @@ _PATRONES_PRECIO = [
     r"€\s*(\d{1,4}[.,]\d{2})",        # €1,14
     r"(\d{1,4}[.,]\d{2})\s*eur",      # 1.14 eur
     r"precio[:\s]+(\d{1,4}[.,]\d+)",  # precio: 1,14
+    r"price[:\s]+(\d{1,4}[.,]\d+)",   # price: 1.14
     r"(\d{1,4})\s*€(?!\s*/)",         # 2€ (entero, sin unidad — último recurso)
 ]
 
@@ -266,6 +281,7 @@ _PATRONES_PRECIO_KG = [
     r"(\d{1,4}[.,]\d+)\s*€\s*/\s*(kg|Kg|KG|g|gr|l|L|lt|ud|und|unid)",
     r"(\d{1,4}[.,]\d+)\s*€/(kg|l|ud)",
     r"([\d.,]+)\s*€\s+(?:el\s+)?(kg|kilo|litro?|ud)",
+    r"(\d{1,4}[.,]\d+)\s*(?:€/kg|€/l|€/ud)",  # Formato: 2.99€/kg
 ]
 
 
@@ -290,7 +306,7 @@ def extraer_precio_kg(texto: str) -> tuple[Optional[float], Optional[str]]:
         if m:
             try:
                 valor = float(m.group(1).replace(",", "."))
-                unidad = m.group(2).lower()
+                unidad = m.group(2).lower() if len(m.groups()) > 1 else "kg"
                 # Normalizar unidades
                 unidad = {"kilo": "kg", "litro": "L", "litros": "L",
                           "lt": "L", "l": "L", "gr": "g", "und": "ud",
@@ -314,13 +330,17 @@ def extraer_nombre(elemento: Tag) -> Optional[str]:
     selectores = [
         ".product-name",
         ".product-title",
+        ".producto-nombre",
+        ".producto-titulo",
         "[class*='nombre']",
         "[class*='titulo']",
         "[class*='name']",
         "[class*='title']",
-        "h2", "h3", "h4",
+        "h2", "h3", "h4", "h5",
         "p:first-of-type",
         "span:first-of-type",
+        ".card-title",
+        "[data-testid='product-name']",
     ]
 
     for selector in selectores:
@@ -330,18 +350,12 @@ def extraer_nombre(elemento: Tag) -> Optional[str]:
             if texto and len(texto) >= 4:
                 return _limpiar_nombre(texto)
 
-    # Último recurso: texto completo sin precio
-    texto_completo = elemento.get_text(" ", strip=True)
-    # Eliminar precio del texto para no confundirlo con el nombre
-    texto_sin_precio = re.sub(r"\d+[.,]\d+\s*€.*", "", texto_completo).strip()
-    if len(texto_sin_precio) >= 4:
-        # Tomar solo la primera línea significativa
-        primera_linea = next(
-            (l.strip() for l in texto_sin_precio.split("\n") if len(l.strip()) >= 4),
-            None
-        )
-        if primera_linea:
-            return _limpiar_nombre(primera_linea[:150])
+    # Buscar cualquier texto que no sea precio
+    for texto_elemento in elemento.find_all(text=True, recursive=True):
+        texto = texto_elemento.strip()
+        if texto and len(texto) >= 4 and not re.search(r"\d+[.,]\d+\s*€", texto):
+            if not re.match(r"^\d+$", texto):  # No es solo un número
+                return _limpiar_nombre(texto[:150])
 
     return None
 
@@ -351,6 +365,8 @@ def _limpiar_nombre(nombre: str) -> str:
     nombre = re.sub(r"\s+", " ", nombre)
     # Eliminar sufijos numéricos de conteo ("Cereales42" → "Cereales")
     nombre = re.sub(r"\d+$", "", nombre)
+    # Eliminar "Nuevo" o etiquetas similares al inicio
+    nombre = re.sub(r"^(NUEVO|NEW|OFERTA)\s*[-:]\s*", "", nombre, flags=re.IGNORECASE)
     # Eliminar caracteres no válidos manteniendo acentos y puntuación básica
     nombre = re.sub(
         r"[^\w\sáéíóúàèìòùäëïöüñçÁÉÍÓÚÀÈÌÒÙÄËÏÖÜÑÇ.,\-%()/]", "", nombre
@@ -359,31 +375,20 @@ def _limpiar_nombre(nombre: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE CATEGORÍAS — múltiples patrones de URL
+# EXTRACCIÓN DE CATEGORÍAS — múltiples estrategias (actualizado para nueva estructura)
 # ─────────────────────────────────────────────────────────────────────────────
-# Patrones de URL de categoría ordenados de más a menos específico.
-# RadarSuper usa actualmente: /fitoterapia/c/fitoterapia-213
-# Es decir: /{categoria_slug}/c/{categoria_slug}-{id}
-# El slug de cadena NO aparece en la URL de categoría.
-_PATRONES_CATEGORIA_URL = [
-    r"/([\w-]+)/c/([\w-]+)-(\d+)",     # /fitoterapia/c/fitoterapia-213 (estructura actual)
-    r"/([\w-]+)/c/([\w-]+)",           # /fitoterapia/c/fitoterapia (sin ID numérico)
-    r"/([\w-]+)/categoria/([\w-]+)",   # /fitoterapia/categoria/fitoterapia
-    r"/([\w-]+)/productos/([\w-]+)",   # /fitoterapia/productos/lista
-    r"/c/([\w-]+)-(\d+)",              # /c/fitoterapia-213 (sin prefijo)
-    r"/categorias/([\w-]+)",           # /categorias/fitoterapia
-]
-
-
 def extraer_categorias(cadena_slug: str, diagnostico: bool = False) -> list[dict]:
     """
     Extrae todas las categorías del catálogo de una cadena.
-    Prueba múltiples URLs de entrada y patrones si el principal falla.
+    Versión actualizada para la nueva estructura de RadarSuper (mayo 2026).
+    Prueba múltiples estrategias en orden de especificidad.
     """
+    
+    # ESTRATEGIA 1: URL con /supermercado/ (nueva estructura)
     urls_entrada = [
-        f"{BASE_URL}/{cadena_slug}",
-        f"{BASE_URL}/{cadena_slug}/productos",
         f"{BASE_URL}/supermercado/{cadena_slug}",
+        f"{BASE_URL}/supermercado/{cadena_slug}/categorias",
+        f"{BASE_URL}/{cadena_slug}",
         f"{BASE_URL}/cadena/{cadena_slug}",
     ]
 
@@ -401,132 +406,127 @@ def extraer_categorias(cadena_slug: str, diagnostico: bool = False) -> list[dict
         log.error(f"No se pudo acceder al catálogo de {cadena_slug}")
         return []
 
-    for patron_str in _PATRONES_CATEGORIA_URL:
-        patron = re.compile(patron_str)
-        categorias = _extraer_categorias_con_patron(soup, patron, cadena_slug)
-        if categorias:
-            log.info(f"  → {len(categorias)} categorías encontradas (patrón: {patron_str})")
-            return categorias
-
-    log.warning(
-        f"⚠️  CAMBIO ESTRUCTURAL: no se detectaron categorías con los patrones conocidos "
-        f"para '{cadena_slug}'. Intentando extracción genérica..."
-    )
-    if diagnostico:
-        _guardar_diagnostico(url_usada, str(soup))
-
-    return _extraer_categorias_generico(soup, cadena_slug)
-
-
-def _extraer_categorias_con_patron(
-    soup: BeautifulSoup, patron: re.Pattern, cadena_slug: str
-) -> list[dict]:
-    """Extrae categorías usando un patrón de URL concreto."""
-    categorias: list[dict] = []
-    vistos: set[str] = set()
-
+    # ESTRATEGIA 2: Buscar enlaces de categoría con patrones actualizados
+    categorias = []
+    
+    # Patrones de URL para categorías en la nueva estructura
+    # Ejemplos observados:
+    # - /supermercado/mercadona/c/aceite-12
+    # - /c/aceite-12
+    # - /categoria/aceite
+    patrones_url_categoria = [
+        r"/supermercado/[\w-]+/c/([\w-]+)(?:-\d+)?",      # /supermercado/mercadona/c/aceite-12
+        r"/c/([\w-]+)(?:-\d+)?",                          # /c/aceite-12
+        r"/categoria/([\w-]+)",                           # /categoria/aceite
+        r"/supermercado/[\w-]+/([\w-]+)(?:/|$)",          # /supermercado/mercadona/aceite
+    ]
+    
+    vistos = set()
+    
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if href in vistos:
+        texto = a.get_text(strip=True)
+        
+        # Filtros: excluir productos, login, etc.
+        if any(x in href.lower() for x in ["/p/", "/producto", "login", "carrito", "account", "wishlist"]):
             continue
-
-        # Excluir links que no son de categoría
-        if any(x in href for x in ["/p/", "/m/", "/blog/", "/tiendas/", "?", "#"]):
+        
+        if not texto or len(texto) < 3 or len(texto) > 80:
             continue
-
-        m = patron.search(href)
-        if not m:
-            continue
-
-        # El patrón devuelve grupos. Para /{cadena}/c/{slug}-{id}:
-        # Grupos: ('mercadona', 'aceite-especias-salsas', '12')
-        # Queremos el penúltimo (slug antes del ID)
-        grupos = m.groups()
-        if not grupos:
-            continue
-
-        # Si el primer grupo es la cadena (ej: 'mercadona'), el slug es el segundo
-        # Si no, el slug es el primero o el penúltimo según el patrón
-        if grupos[0] == cadena_slug:
-            # Patrón: /{cadena}/c/{slug}-{id}
-            slug_cat = grupos[1] if len(grupos) > 1 else grupos[0]
-        else:
-            # Patrón sin cadena: /c/{slug}-{id} o /{slug}/c/{slug}...
-            # Tomar el penúltimo si es texto, el último si no es número
-            slug_cat = None
-            for g in reversed(grupos):
-                if g and not g.isdigit() and len(g) >= 3:
-                    slug_cat = g
-                    break
-            if not slug_cat:
-                slug_cat = grupos[0] if grupos else ""
-
-        if not slug_cat or len(slug_cat) < 3:
-            continue
-
-        nombre = a.get_text(strip=True)
-        nombre = re.sub(r"\d+$", "", nombre).strip()
-
-        if not nombre or len(nombre) < 3:
-            continue
-
-        vistos.add(href)
-
-        cat_app = _resolver_categoria(slug_cat)
-        url_completa = (BASE_URL + href) if href.startswith("/") else href
-
-        categorias.append({
-            "slug":    slug_cat,
-            "nombre":  nombre,
-            "url":     url_completa,
-            "cat_app": cat_app,
-        })
-
+        
+        # Intentar hacer match con algún patrón de categoría
+        slug_cat = None
+        for patron in patrones_url_categoria:
+            match = re.search(patron, href)
+            if match:
+                slug_cat = match.group(1)
+                break
+        
+        if not slug_cat:
+            # Si no hay match con patrones, ver si parece una categoría por el texto
+            # y porque está dentro de un menú de navegación
+            padre = a.find_parent(["nav", "ul", "div"])
+            if padre and any(cls in str(padre.get("class", [])).lower() for cls in ["menu", "nav", "categ"]):
+                slug_cat = texto.lower().replace(" ", "-").replace("_", "-")
+        
+        if slug_cat and slug_cat not in vistos:
+            vistos.add(slug_cat)
+            texto_limpio = re.sub(r"\s*\(\d+\)\s*$", "", texto).strip()
+            url_categoria = href if href.startswith("http") else BASE_URL + href
+            
+            categorias.append({
+                "slug":    slug_cat,
+                "nombre":  texto_limpio,
+                "url":     url_categoria,
+                "cat_app": _resolver_categoria(slug_cat),
+            })
+    
+    # Si no encontramos categorías con el método anterior, intentar extracción genérica
+    if not categorias:
+        log.warning(f"⚠️ No se detectaron categorías con patrones específicos para '{cadena_slug}'. Intentando extracción genérica...")
+        categorias = _extraer_categorias_generico(soup, cadena_slug)
+    
+    if not categorias:
+        log.error("❌ No se pudieron extraer categorías de ninguna forma. Guardando HTML para depuración...")
+        if diagnostico:
+            _guardar_diagnostico(url_usada, str(soup))
+        return []
+    
+    log.info(f"  → {len(categorias)} categorías encontradas")
     return categorias
 
 
 def _extraer_categorias_generico(soup: BeautifulSoup, cadena_slug: str) -> list[dict]:
     """
-    Extracción de último recurso: busca cualquier link de navegación
-    que no sea la home ni un producto.
+    Extracción de último recurso: busca cualquier link que parezca una categoría
+    basándose en el texto y contexto.
     """
-    categorias: list[dict] = []
-    vistos: set[str] = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Excluir links que claramente no son categorías
-        if any(x in href for x in ["/p/", "?", "#", "mailto:", "javascript:", ".pdf"]):
-            continue
-        if href in vistos or href in ("/", f"/{cadena_slug}"):
-            continue
-        if not href.startswith(f"/{cadena_slug}/"):
-            continue
-
-        vistos.add(href)
-        nombre = a.get_text(strip=True)
-        nombre = re.sub(r"\d+$", "", nombre).strip()
-        if not nombre or len(nombre) < 3:
-            continue
-
-        slug_cat = href.split("/")[-1]
-        cat_app  = _resolver_categoria(slug_cat)
-
-        categorias.append({
-            "slug":    slug_cat,
-            "nombre":  nombre,
-            "url":     BASE_URL + href,
-            "cat_app": cat_app,
-        })
-
-    if not categorias:
-        log.error(
-            "❌ No se pudieron extraer categorías de ninguna forma. "
-            "La estructura de la web ha cambiado significativamente. "
-            "Usa --diagnostico para guardar el HTML y revisar manualmente."
-        )
-
-    return categorias
+    categorias = []
+    vistos = set()
+    
+    # Buscar en contenedores típicos de navegación
+    contenedores = soup.find_all(["nav", "aside", "div", "ul"], 
+                                 class_=re.compile(r"(menu|nav|categor|sidebar|filter|depart)", re.IGNORECASE))
+    
+    if not contenedores:
+        # Si no hay contenedores específicos, buscar cualquier lista
+        contenedores = soup.find_all(["ul", "div"])
+    
+    for contenedor in contenedores:
+        for a in contenedor.find_all("a", href=True):
+            href = a["href"]
+            texto = a.get_text(strip=True)
+            
+            # Condiciones para ser categoría
+            if not texto or len(texto) < 3 or len(texto) > 60:
+                continue
+            
+            if any(x in href.lower() for x in ["/p/", "/producto", "login", "carrito", "cuenta"]):
+                continue
+            
+            # Evitar enlaces de paginación
+            if texto.isdigit() and len(texto) <= 3:
+                continue
+            
+            texto_limpio = re.sub(r"\s*\(\d+\)\s*$", "", texto).strip()
+            slug_cat = texto_limpio.lower().replace(" ", "-").replace("_", "-")
+            
+            if texto_limpio and slug_cat not in vistos:
+                vistos.add(slug_cat)
+                url_categoria = href if href.startswith("http") else BASE_URL + href
+                
+                categorias.append({
+                    "slug":    slug_cat,
+                    "nombre":  texto_limpio,
+                    "url":     url_categoria,
+                    "cat_app": _resolver_categoria(slug_cat),
+                })
+    
+    # Limitar a categorías que parecen legítimas (no demasiadas)
+    categorias = [c for c in categorias if not any(x in c["nombre"].lower() 
+                  for x in ["terminos", "condiciones", "privacidad", "contacto", "ayuda"])]
+    
+    return categorias[:50]  # Máximo 50 categorías por cadena
 
 
 def _resolver_categoria(slug: str) -> str:
@@ -538,6 +538,11 @@ def _resolver_categoria(slug: str) -> str:
     # Exacta
     if slug in CATEGORIA_MAP:
         return CATEGORIA_MAP[slug]
+    
+    # Eliminar números y prefijos comunes
+    slug_limpio = re.sub(r"-\d+$", "", slug)
+    if slug_limpio in CATEGORIA_MAP:
+        return CATEGORIA_MAP[slug_limpio]
 
     # Parcial: el slug contiene o está contenido en una clave del mapa
     for clave, cat in CATEGORIA_MAP.items():
@@ -553,10 +558,11 @@ def _resolver_categoria(slug: str) -> str:
 # EXTRACCIÓN DE PRODUCTOS — múltiples estrategias
 # ─────────────────────────────────────────────────────────────────────────────
 _PATRONES_PRODUCTO_URL = [
-    r"/([\w-]+)/p/([\w-]+)",      # /mercadona/p/leche-entera-asturiana
-    r"/([\w-]+)/producto/([\w-]+)", # /mercadona/producto/leche-entera
-    r"/productos/([\w-]+)",        # /productos/leche-entera
-    r"/p/([\w-]+)",                # /p/leche-entera (sin cadena)
+    r"/p/([\w-]+)",                      # /p/leche-entera (simplificado)
+    r"/producto/([\w-]+)",              # /producto/leche-entera
+    r"/[^/]+/p/([\w-]+)",               # /mercadona/p/leche-entera
+    r"/[^/]+/producto/([\w-]+)",        # /mercadona/producto/leche-entera
+    r"/supermercado/[^/]+/p/([\w-]+)",   # /supermercado/mercadona/p/leche-entera
 ]
 
 
@@ -569,42 +575,63 @@ def parsear_productos_pagina(
     """
     productos: list[dict] = []
     vistos: set[str] = set()
-    total_enlaces = 0
-
-    for patron_str in _PATRONES_PRODUCTO_URL:
-        patron = re.compile(patron_str)
-        encontrados = soup.find_all("a", href=patron)
-        if not encontrados:
+    
+    # También buscar contenedores de producto directamente
+    contenedores_producto = soup.find_all(["div", "article"], 
+                                          class_=re.compile(r"(product|item|card)", re.IGNORECASE))
+    
+    for contenedor in contenedores_producto:
+        nombre = extraer_nombre(contenedor)
+        if not nombre:
             continue
-
-        total_enlaces = len(encontrados)
-        log.debug(f"Usando patrón de producto '{patron_str}' → {total_enlaces} enlaces")
-
-        for a in encontrados:
+        
+        # Buscar precio dentro del contenedor
+        texto_contenedor = contenedor.get_text(" ", strip=True)
+        precio = extraer_precio(texto_contenedor)
+        if precio is None:
+            continue
+        
+        precio_kg, unidad_precio = extraer_precio_kg(texto_contenedor)
+        
+        # Buscar URL del producto
+        enlace = contenedor.find("a", href=True)
+        url_producto = BASE_URL + enlace["href"] if enlace and enlace["href"].startswith("/") else None
+        if not url_producto and enlace:
+            url_producto = enlace["href"]
+        
+        if nombre and nombre not in vistos:
+            vistos.add(nombre)
+            productos.append({
+                "nombre":        nombre,
+                "precio":        precio,
+                "precio_kg":     precio_kg,
+                "unidad_precio": unidad_precio,
+                "url":           url_producto or "",
+            })
+    
+    # Si no encontramos productos con contenedores, buscar por enlaces
+    if not productos:
+        for a in soup.find_all("a", href=True):
             href = a["href"]
+            if not any(re.search(patron, href) for patron in _PATRONES_PRODUCTO_URL):
+                continue
+            
             if href in vistos:
                 continue
-            vistos.add(href)
-
-            texto = a.get_text(" ", strip=True)
-
+            
             nombre = extraer_nombre(a)
-            if not nombre or len(nombre) < 4:
-                # Intentar con el texto directo
-                lineas = [l.strip() for l in texto.split("\n") if l.strip() and len(l.strip()) >= 4]
-                if lineas:
-                    nombre = _limpiar_nombre(lineas[0][:150])
             if not nombre:
                 continue
-
+            
+            texto = a.get_text(" ", strip=True)
             precio = extraer_precio(texto)
             if precio is None:
                 continue
-
+            
+            vistos.add(href)
             precio_kg, unidad_precio = extraer_precio_kg(texto)
-
-            url_producto = (BASE_URL + href) if href.startswith("/") else href
-
+            url_producto = BASE_URL + href if href.startswith("/") else href
+            
             productos.append({
                 "nombre":        nombre,
                 "precio":        precio,
@@ -612,20 +639,7 @@ def parsear_productos_pagina(
                 "unidad_precio": unidad_precio,
                 "url":           url_producto,
             })
-
-        # Si encontramos productos con este patrón, no seguimos
-        if productos:
-            break
-
-    # Aviso de cambio estructural
-    if total_enlaces > 0 and not productos:
-        log.warning(
-            f"⚠️  CAMBIO ESTRUCTURAL: {total_enlaces} enlaces de producto encontrados "
-            f"pero no se pudo extraer ningún dato. Revisa los selectores."
-        )
-        if diagnostico:
-            _guardar_diagnostico("pagina_producto", str(soup))
-
+    
     return productos
 
 
@@ -642,6 +656,7 @@ def get_total_paginas(soup: BeautifulSoup) -> int:
         _paginas_desde_links,        # ?page=N en los hrefs
         _paginas_desde_paginador,    # selectores CSS de paginación
         _paginas_desde_data,         # data-total-pages / data-pages
+        _paginas_desde_resultados,   # "Mostrando 1-24 de 156 resultados"
     ]
 
     for estrategia in estrategias:
@@ -673,7 +688,7 @@ def _paginas_desde_texto(soup: BeautifulSoup) -> Optional[int]:
 def _paginas_desde_links(soup: BeautifulSoup) -> Optional[int]:
     max_page = 0
     for a in soup.find_all("a", href=True):
-        m = re.search(r"[?&]page=(\d+)", a["href"])
+        m = re.search(r"[?&]page[=:](\d+)", a["href"])
         if m:
             try:
                 num = int(m.group(1))
@@ -690,6 +705,8 @@ def _paginas_desde_paginador(soup: BeautifulSoup) -> Optional[int]:
         ".paginacion a",
         "[class*='pag'] a",
         "[class*='page-item'] a",
+        ".pager a",
+        "[role='navigation'] a",
     ]
     for selector in selectores:
         elementos = soup.select(selector)
@@ -704,12 +721,34 @@ def _paginas_desde_paginador(soup: BeautifulSoup) -> Optional[int]:
 
 
 def _paginas_desde_data(soup: BeautifulSoup) -> Optional[int]:
-    for attr in ("data-total-pages", "data-pages", "data-page-count"):
+    for attr in ("data-total-pages", "data-pages", "data-page-count", "data-total"):
         el = soup.find(attrs={attr: True})
         if el:
             try:
                 return int(el[attr])
             except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _paginas_desde_resultados(soup: BeautifulSoup) -> Optional[int]:
+    """Calcula páginas a partir de "Mostrando X de Y resultados" """
+    texto = soup.get_text(" ")
+    patrones = [
+        r"Mostrando\s+\d+\s+de\s+(\d+)\s+resultados",
+        r"Showing\s+\d+\s+of\s+(\d+)\s+results",
+        r"(\d+)\s+resultados\s+encontrados",
+        r"(\d+)\s+products",
+    ]
+    for p in patrones:
+        m = re.search(p, texto, re.IGNORECASE)
+        if m:
+            try:
+                total_resultados = int(m.group(1))
+                # Asumimos ~24 productos por página
+                paginas = (total_resultados + 23) // 24
+                return max(1, paginas)
+            except (ValueError, IndexError):
                 continue
     return None
 
@@ -839,6 +878,8 @@ def scrape_categoria(
         return
 
     total_pags = get_total_paginas(soup)
+    log.info(f"     Total páginas detectadas: {total_pags}")
+    
     if modo_test:
         total_pags = min(total_pags, 1)
 
@@ -908,7 +949,7 @@ def main(
 ):
     inicio_ts = datetime.now()
     log.info("=" * 65)
-    log.info(f"🛒 Scraper RadarSuper — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🛒 Scraper RadarSuper v3 — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
     log.info("=" * 65)
 
     sb = get_supabase()
@@ -919,6 +960,8 @@ def main(
 
     if not tiendas_map:
         log.error("❌ No se pudieron cargar las tiendas. Abortando.")
+        log.info("Asegúrate de que la tabla 'tiendas' existe y contiene las cadenas:")
+        log.info(f"  - {', '.join(CADENAS.values())}")
         sys.exit(1)
 
     stats = {
