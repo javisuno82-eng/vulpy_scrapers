@@ -1,25 +1,19 @@
 """
-scraper_radarsuper.py
-=====================
-Scraper diario de radarsuper.com → Supabase (gastos_app)
+scraper_mercadona.py
+====================
+Scraper exclusivo para Mercadona en radarsuper.com → Supabase (gastos_app)
 
-VERSIÓN v4 - CORREGIDA (mayo 2026)
-  - Corregida la extracción de categorías usando la estructura real:
-    https://radarsuper.com/{cadena}/c/{categoria}-{id}
-  - Extracción robusta de productos desde páginas de categoría
-  - Reintentos con backoff exponencial (red + HTTP 429/503)
+VERSIÓN ESPECÍFICA PARA MERCADONA
+  - Usa las URLs reales de categorías de Mercadona
+  - Extrae productos de las páginas de categoría
+  - Reintentos con backoff exponencial
   - Rotación de User-Agent para evitar bloqueos
-  - Validación estricta de datos antes de tocar Supabase
-  - Carga paginada de productos (evita timeout en catálogos grandes)
-  - Modo diagnóstico: guarda HTML problemático para inspección manual
-  - Resumen JSON al final para integración con GitHub Actions
+  - Modo diagnóstico para depuración
 
 Uso:
-  python scraper_radarsuper.py                        # todo el catálogo
-  python scraper_radarsuper.py --cadena mercadona     # solo Mercadona
-  python scraper_radarsuper.py --cadena carrefour     # solo Carrefour
-  python scraper_radarsuper.py --test                 # 3 categorías, 1 página
-  python scraper_radarsuper.py --diagnostico          # guarda HTML problemático
+  python scraper_mercadona.py                        # todo el catálogo
+  python scraper_mercadona.py --test                 # 3 categorías, 1 página
+  python scraper_mercadona.py --diagnostico          # guarda HTML problemático
 
 Configuración (.env):
   SUPABASE_URL=https://xxxx.supabase.co
@@ -66,64 +60,167 @@ SLEEP_PRODUCTO  = 0.1
 
 # Reintentos de red
 MAX_REINTENTOS = 4
-BACKOFF_BASE   = 2.0   # espera = BACKOFF_BASE ** intento
+BACKOFF_BASE   = 2.0
 
 # Carpeta para HTMLs de diagnóstico
-DIAG_DIR = Path("diagnostico_radarsuper")
+DIAG_DIR = Path("diagnostico_mercadona")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CADENAS DISPONIBLES
-# Clave = slug de URL, valor = nombre exacto en tabla `tiendas` de Supabase.
+# CATEGORÍAS DE MERCADONA (mapeo manual basado en URLs reales)
+# El formato es: https://radarsuper.com/mercadona/c/{slug}-{id}
 # ─────────────────────────────────────────────────────────────────────────────
-CADENAS: dict[str, str] = {
-    "mercadona": "Mercadona",
-    "carrefour": "Carrefour",
-    "dia":       "Dia",
-    "alcampo":   "Alcampo",
-    "lidl":      "Lidl",
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAPEO DE CATEGORÍAS
-# Clave = slug de categoría en RadarSuper, valor = categoría en gastos_app.
-# ─────────────────────────────────────────────────────────────────────────────
-CATEGORIA_MAP: dict[str, str] = {
-    "aceite-especias-salsas":      "condimentos",
-    "aceite-vinagre-sal":          "condimentos",
-    "agua-refrescos":              "bebidas",
-    "aperitivos":                  "snacks",
-    "arroz-legumbres-pasta":       "pasta",
-    "azucar-caramelos-chocolate":  "dulces",
-    "bebe":                        "higiene",
-    "bodega":                      "bebidas",
-    "cacao-cafe-e-infusiones":     "café",
-    "carne":                       "carne",
-    "cereales-galletas":           "galletas",
-    "charcuteria-quesos":          "charcutería",
-    "congelados":                  "congelados",
-    "conservas-caldos-cremas":     "conservas",
-    "cuidado-cabello":             "higiene",
-    "cuidado-facial-corporal":     "higiene",
-    "fitoterapia-parafarmacia":    "farmacia",
-    "fruta-verdura":               "fruta",
-    "huevos-leche-mantequilla":    "lácteos",
-    "limpieza-hogar":              "limpieza",
-    "maquillaje":                  "higiene",
-    "marisco-pescado":             "pescado",
-    "mascotas":                    "mascotas",
-    "panaderia-pasteleria":        "pan",
-    "pizzas-platos-preparados":    "preparados",
-    "postres-yogures":             "lácteos",
-    "zumos":                       "bebidas",
-    # Nuevas categorías observadas
-    "bebidas-energeticas":         "bebidas",
-    "cafe":                        "café",
-    "dulces-y-chocolates":         "dulces",
-    "higiene-bucal":               "higiene",
-    "higiene-facial":              "higiene",
-    "leche-y-derivados":           "lácteos",
-    "pan-y-bollería":              "pan",
-}
+CATEGORIAS_MERCADONA = [
+    {
+        "slug": "bebe-24",
+        "nombre": "Bebé",
+        "url": "https://radarsuper.com/mercadona/c/bebe-24",
+        "cat_app": "higiene"
+    },
+    {
+        "slug": "aceite-especias-salsas-12",
+        "nombre": "Aceite, especias y salsas",
+        "url": "https://radarsuper.com/mercadona/c/aceite-especias-salsas-12",
+        "cat_app": "condimentos"
+    },
+    {
+        "slug": "aceite-vinagre-sal-112",
+        "nombre": "Aceite, vinagre y sal",
+        "url": "https://radarsuper.com/mercadona/c/aceite-vinagre-sal-112",
+        "cat_app": "condimentos"
+    },
+    {
+        "slug": "carne-3",
+        "nombre": "Carne",
+        "url": "https://radarsuper.com/mercadona/c/carne-3",
+        "cat_app": "carne"
+    },
+    {
+        "slug": "agua-refrescos-21",
+        "nombre": "Agua y refrescos",
+        "url": "https://radarsuper.com/mercadona/c/agua-refrescos-21",
+        "cat_app": "bebidas"
+    },
+    {
+        "slug": "aperitivos-10",
+        "nombre": "Aperitivos",
+        "url": "https://radarsuper.com/mercadona/c/aperitivos-10",
+        "cat_app": "snacks"
+    },
+    {
+        "slug": "arroz-legumbres-pasta-9",
+        "nombre": "Arroz, legumbres y pasta",
+        "url": "https://radarsuper.com/mercadona/c/arroz-legumbres-pasta-9",
+        "cat_app": "pasta"
+    },
+    {
+        "slug": "azucar-caramelos-chocolate-8",
+        "nombre": "Azúcar, caramelos y chocolate",
+        "url": "https://radarsuper.com/mercadona/c/azucar-caramelos-chocolate-8",
+        "cat_app": "dulces"
+    },
+    {
+        "slug": "bodega-20",
+        "nombre": "Bodega",
+        "url": "https://radarsuper.com/mercadona/c/bodega-20",
+        "cat_app": "bebidas"
+    },
+    {
+        "slug": "cacao-cafe-e-infusiones-19",
+        "nombre": "Cacao, café e infusiones",
+        "url": "https://radarsuper.com/mercadona/c/cacao-cafe-e-infusiones-19",
+        "cat_app": "café"
+    },
+    {
+        "slug": "cereales-galletas-7",
+        "nombre": "Cereales y galletas",
+        "url": "https://radarsuper.com/mercadona/c/cereales-galletas-7",
+        "cat_app": "galletas"
+    },
+    {
+        "slug": "charcuteria-quesos-6",
+        "nombre": "Charcutería y quesos",
+        "url": "https://radarsuper.com/mercadona/c/charcuteria-quesos-6",
+        "cat_app": "charcutería"
+    },
+    {
+        "slug": "congelados-5",
+        "nombre": "Congelados",
+        "url": "https://radarsuper.com/mercadona/c/congelados-5",
+        "cat_app": "congelados"
+    },
+    {
+        "slug": "conservas-caldos-cremas-4",
+        "nombre": "Conservas, caldos y cremas",
+        "url": "https://radarsuper.com/mercadona/c/conservas-caldos-cremas-4",
+        "cat_app": "conservas"
+    },
+    {
+        "slug": "fruta-verdura-1",
+        "nombre": "Fruta y verdura",
+        "url": "https://radarsuper.com/mercadona/c/fruta-verdura-1",
+        "cat_app": "fruta"
+    },
+    {
+        "slug": "huevos-leche-mantequilla-18",
+        "nombre": "Huevos, leche y mantequilla",
+        "url": "https://radarsuper.com/mercadona/c/huevos-leche-mantequilla-18",
+        "cat_app": "lácteos"
+    },
+    {
+        "slug": "limpieza-hogar-25",
+        "nombre": "Limpieza del hogar",
+        "url": "https://radarsuper.com/mercadona/c/limpieza-hogar-25",
+        "cat_app": "limpieza"
+    },
+    {
+        "slug": "marisco-pescado-2",
+        "nombre": "Marisco y pescado",
+        "url": "https://radarsuper.com/mercadona/c/marisco-pescado-2",
+        "cat_app": "pescado"
+    },
+    {
+        "slug": "mascotas-29",
+        "nombre": "Mascotas",
+        "url": "https://radarsuper.com/mercadona/c/mascotas-29",
+        "cat_app": "mascotas"
+    },
+    {
+        "slug": "panaderia-pasteleria-17",
+        "nombre": "Panadería y pastelería",
+        "url": "https://radarsuper.com/mercadona/c/panaderia-pasteleria-17",
+        "cat_app": "pan"
+    },
+    {
+        "slug": "pizzas-platos-preparados-11",
+        "nombre": "Pizzas y platos preparados",
+        "url": "https://radarsuper.com/mercadona/c/pizzas-platos-preparados-11",
+        "cat_app": "preparados"
+    },
+    {
+        "slug": "postres-yogures-16",
+        "nombre": "Postres y yogures",
+        "url": "https://radarsuper.com/mercadona/c/postres-yogures-16",
+        "cat_app": "lácteos"
+    },
+    {
+        "slug": "zumos-22",
+        "nombre": "Zumos",
+        "url": "https://radarsuper.com/mercadona/c/zumos-22",
+        "cat_app": "bebidas"
+    },
+    {
+        "slug": "cuidado-personal-15",
+        "nombre": "Cuidado personal",
+        "url": "https://radarsuper.com/mercadona/c/cuidado-personal-15",
+        "cat_app": "higiene"
+    },
+    {
+        "slug": "drogueria-14",
+        "nombre": "Droguería",
+        "url": "https://radarsuper.com/mercadona/c/drogueria-14",
+        "cat_app": "limpieza"
+    },
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -133,7 +230,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("scraper_radarsuper.log", encoding="utf-8"),
+        logging.FileHandler("scraper_mercadona.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -143,12 +240,10 @@ log = logging.getLogger(__name__)
 # HTTP — sesión con reintentos y User-Agent rotativo
 # ─────────────────────────────────────────────────────────────────────────────
 _USER_AGENTS = [
-    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"),
-    ("Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"),
-    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"),
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
 _ua_index = 0
 
@@ -172,14 +267,11 @@ def _crear_sesion() -> requests.Session:
     return s
 
 
-_sesion: requests.Session = _crear_sesion()
+_sesion = _crear_sesion()
 
 
 def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
-    """
-    Descarga una página con reintentos y backoff exponencial.
-    Devuelve BeautifulSoup o None si falla tras todos los intentos.
-    """
+    """Descarga una página con reintentos y backoff exponencial."""
     global _sesion
 
     for intento in range(1, MAX_REINTENTOS + 1):
@@ -196,87 +288,68 @@ def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
 
             if r.status_code in (502, 503, 504):
                 espera = BACKOFF_BASE ** intento
-                log.warning(f"HTTP {r.status_code} en {url} (intento {intento}/{MAX_REINTENTOS}) — reintentando en {espera:.0f}s")
+                log.warning(f"HTTP {r.status_code} en {url} — reintentando en {espera:.0f}s")
                 time.sleep(espera)
                 _sesion = _crear_sesion()
                 continue
 
             if r.status_code == 403:
-                log.warning(f"HTTP 403 en {url} — puede que hayamos sido bloqueados")
+                log.warning(f"HTTP 403 en {url} — posible bloqueo")
                 if diagnostico:
                     _guardar_diagnostico(url, r.text)
                 return None
 
             r.raise_for_status()
-
             soup = BeautifulSoup(r.text, "html.parser")
 
-            if diagnostico and _parece_vacia(soup):
+            if diagnostico:
                 _guardar_diagnostico(url, r.text)
 
             return soup
 
-        except requests.exceptions.ConnectionError as e:
+        except requests.exceptions.RequestException as e:
             espera = BACKOFF_BASE ** intento
-            log.warning(f"Error de conexión en {url} (intento {intento}/{MAX_REINTENTOS}): {e}")
+            log.warning(f"Error en {url} (intento {intento}): {e}")
             time.sleep(espera)
             _sesion = _crear_sesion()
-
-        except requests.exceptions.Timeout:
-            espera = BACKOFF_BASE ** intento
-            log.warning(f"Timeout en {url} (intento {intento}/{MAX_REINTENTOS}) — reintentando en {espera:.0f}s")
-            time.sleep(espera)
-
-        except requests.RequestException as e:
-            log.error(f"Error irrecuperable en {url}: {e}")
-            return None
 
     log.error(f"No se pudo descargar {url} tras {MAX_REINTENTOS} intentos")
     return None
 
 
-def _parece_vacia(soup: BeautifulSoup) -> bool:
-    texto = soup.get_text(strip=True)
-    if len(texto) < 200:
-        return True
-    alertas = ["acceso restringido", "captcha", "403", "503", "error interno", "access denied", "cloudflare"]
-    return any(a in texto.lower() for a in alertas)
-
-
 def _guardar_diagnostico(url: str, html: str):
+    """Guarda HTML para depuración."""
     try:
         DIAG_DIR.mkdir(exist_ok=True)
         nombre = hashlib.md5(url.encode()).hexdigest()[:8]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = DIAG_DIR / f"{ts}_{nombre}.html"
         path.write_text(html, encoding="utf-8")
-        log.warning(f"🔍 HTML de diagnóstico guardado en {path}")
+        log.warning(f"🔍 HTML guardado: {path}")
     except Exception as e:
         log.debug(f"No se pudo guardar diagnóstico: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE PRECIO — múltiples patrones con validación
+# EXTRACCIÓN DE PRECIO
 # ─────────────────────────────────────────────────────────────────────────────
 _PATRONES_PRECIO = [
-    r"(\d{1,4}[.,]\d{2})\s*€",        # 1,14€ · 12.50€
-    r"€\s*(\d{1,4}[.,]\d{2})",        # €1,14
-    r"(\d{1,4}[.,]\d{2})\s*eur",      # 1.14 eur
-    r"precio[:\s]+(\d{1,4}[.,]\d+)",  # precio: 1,14
-    r"price[:\s]+(\d{1,4}[.,]\d+)",   # price: 1.14
-    r"(\d{1,4})\s*€(?!\s*/)",         # 2€ (entero)
+    r"(\d{1,4}[.,]\d{2})\s*€",
+    r"€\s*(\d{1,4}[.,]\d{2})",
+    r"(\d{1,4}[.,]\d{2})\s*eur",
+    r"precio[:\s]+(\d{1,4}[.,]\d+)",
+    r"(\d{1,4})\s*€",
 ]
 
 _PATRONES_PRECIO_KG = [
-    r"(\d{1,4}[.,]\d+)\s*€\s*/\s*(kg|Kg|KG|g|gr|l|L|lt|ud|und|unid)",
+    r"(\d{1,4}[.,]\d+)\s*€\s*/\s*(kg|Kg|KG|g|l|L|ud)",
     r"(\d{1,4}[.,]\d+)\s*€/(kg|l|ud)",
-    r"([\d.,]+)\s*€\s+(?:el\s+)?(kg|kilo|litro?|ud)",
-    r"(\d{1,4}[.,]\d+)\s*(?:€/kg|€/l|€/ud)",
+    r"(\d{1,4}[.,]\d+)\s*(?:€/kg|€/l)",
 ]
 
 
 def extraer_precio(texto: str) -> Optional[float]:
-    """Extrae el precio principal del texto usando múltiples patrones."""
+    """Extrae el precio del texto."""
     for patron in _PATRONES_PRECIO:
         m = re.search(patron, texto, re.IGNORECASE)
         if m:
@@ -290,16 +363,14 @@ def extraer_precio(texto: str) -> Optional[float]:
 
 
 def extraer_precio_kg(texto: str) -> tuple[Optional[float], Optional[str]]:
-    """Extrae el precio por kg/L/ud y su unidad."""
+    """Extrae el precio por kg/L/ud."""
     for patron in _PATRONES_PRECIO_KG:
         m = re.search(patron, texto, re.IGNORECASE)
         if m:
             try:
                 valor = float(m.group(1).replace(",", "."))
                 unidad = m.group(2).lower() if len(m.groups()) > 1 else "kg"
-                unidad = {"kilo": "kg", "litro": "L", "litros": "L",
-                          "lt": "L", "l": "L", "gr": "g", "und": "ud",
-                          "unid": "ud"}.get(unidad, unidad)
+                unidad = {"kilo": "kg", "litro": "L", "lt": "L", "l": "L"}.get(unidad, unidad)
                 if 0.01 <= valor <= 9999.0:
                     return valor, unidad
             except ValueError:
@@ -308,144 +379,14 @@ def extraer_precio_kg(texto: str) -> tuple[Optional[float], Optional[str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE NOMBRE
+# EXTRACCIÓN DE PRODUCTOS
 # ─────────────────────────────────────────────────────────────────────────────
-def extraer_nombre(elemento: Tag) -> Optional[str]:
-    """Extrae el nombre del producto probando múltiples selectores."""
-    selectores = [
-        ".product-name",
-        ".product-title",
-        ".producto-nombre",
-        ".producto-titulo",
-        "[class*='nombre']",
-        "[class*='titulo']",
-        "[class*='name']",
-        "[class*='title']",
-        "h2", "h3", "h4", "h5",
-        "p:first-of-type",
-        "span:first-of-type",
-        ".card-title",
-    ]
-
-    for selector in selectores:
-        el = elemento.select_one(selector)
-        if el:
-            texto = el.get_text(strip=True)
-            if texto and len(texto) >= 4:
-                return _limpiar_nombre(texto)
-
-    # Último recurso: primer texto significativo que no sea precio
-    for texto in elemento.stripped_strings:
-        if len(texto) >= 4 and not re.search(r"\d+[.,]\d+\s*€", texto):
-            if not re.match(r"^\d+$", texto):
-                return _limpiar_nombre(texto[:150])
-
-    return None
-
-
-def _limpiar_nombre(nombre: str) -> str:
-    """Normaliza el nombre eliminando espacios dobles y caracteres raros."""
-    nombre = re.sub(r"\s+", " ", nombre)
-    nombre = re.sub(r"\d+$", "", nombre)  # Eliminar números al final
-    nombre = re.sub(r"^(NUEVO|NEW|OFERTA)\s*[-:]\s*", "", nombre, flags=re.IGNORECASE)
-    nombre = re.sub(r"[^\w\sáéíóúàèìòùäëïöüñçÁÉÍÓÚÀÈÌÒÙÄËÏÖÜÑÇ.,\-%()/]", "", nombre)
-    return nombre.strip()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE CATEGORÍAS - VERSIÓN CORREGIDA
-# ─────────────────────────────────────────────────────────────────────────────
-def extraer_categorias(cadena_slug: str, diagnostico: bool = False) -> list[dict]:
-    """
-    Extrae las categorías de una cadena desde la página principal del supermercado.
-    Estructura real: https://radarsuper.com/mercadona
-    Los enlaces a categorías tienen el formato: /mercadona/c/nombre-categoria-123
-    """
-    url_principal = f"{BASE_URL}/{cadena_slug}"
-    
-    soup = fetch(url_principal, diagnostico=diagnostico)
-    if not soup:
-        log.error(f"No se pudo acceder al catálogo de {cadena_slug}")
-        return []
-    
-    categorias = []
-    vistos = set()
-    
-    # Buscar enlaces que coincidan con el patrón: /{cadena}/c/{categoria}-{id}
-    patron_categoria = re.compile(rf"/{cadena_slug}/c/([\w-]+)-\d+")
-    
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        match = patron_categoria.search(href)
-        
-        if not match:
-            continue
-        
-        slug_cat = match.group(1)
-        if slug_cat in vistos:
-            continue
-        
-        texto = a.get_text(strip=True)
-        if not texto or len(texto) < 3:
-            continue
-        
-        # Limpiar texto: eliminar contador de productos " (86)"
-        texto_limpio = re.sub(r"\s*\(\d+\)\s*$", "", texto).strip()
-        vistos.add(slug_cat)
-        
-        url_categoria = BASE_URL + href if href.startswith("/") else href
-        
-        categorias.append({
-            "slug":    slug_cat,
-            "nombre":  texto_limpio,
-            "url":     url_categoria,
-            "cat_app": _resolver_categoria(slug_cat),
-        })
-    
-    if not categorias:
-        log.error(f"No se encontraron categorías para {cadena_slug}. Usa --diagnostico para depurar.")
-        if diagnostico:
-            _guardar_diagnostico(url_principal, str(soup))
-        return []
-    
-    log.info(f"  → {len(categorias)} categorías encontradas")
-    return categorias
-
-
-def _resolver_categoria(slug: str) -> str:
-    """
-    Mapea un slug de categoría a la categoría de gastos_app.
-    """
-    # Limpiar el slug (eliminar posibles sufijos numéricos)
-    slug_limpio = re.sub(r"-\d+$", "", slug)
-    
-    # Coincidencia exacta
-    if slug_limpio in CATEGORIA_MAP:
-        return CATEGORIA_MAP[slug_limpio]
-    
-    # Coincidencia parcial
-    for clave, cat in CATEGORIA_MAP.items():
-        if clave in slug_limpio or slug_limpio in clave:
-            return cat
-    
-    log.info(f"📋 Categoría no mapeada: '{slug}' → 'general'")
-    return "general"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE PRODUCTOS - VERSIÓN CORREGIDA
-# ─────────────────────────────────────────────────────────────────────────────
-def parsear_productos_pagina(
-    soup: BeautifulSoup, cadena_slug: str, diagnostico: bool = False
-) -> list[dict]:
-    """
-    Extrae productos de una página de categoría.
-    Busca contenedores de producto y extrae nombre, precio y URL.
-    """
+def parsear_productos_pagina(soup: BeautifulSoup, diagnostico: bool = False) -> list[dict]:
+    """Extrae productos de una página de categoría de Mercadona."""
     productos = []
     vistos = set()
     
-    # Buscar enlaces de producto (formato típico: /p/nombre-producto-123)
+    # Buscar todos los enlaces que parecen productos (/p/algo)
     patron_producto = re.compile(r"/p/[\w-]+(?:-\d+)?")
     
     for a in soup.find_all("a", href=True):
@@ -453,26 +394,35 @@ def parsear_productos_pagina(
         if not patron_producto.search(href):
             continue
         
-        # Evitar duplicados
         if href in vistos:
             continue
         vistos.add(href)
         
         # Extraer nombre
-        nombre = extraer_nombre(a)
-        if not nombre:
-            # Intentar con el texto del enlace
-            texto = a.get_text(" ", strip=True)
-            nombre = _limpiar_nombre(texto.split("€")[0].strip())
-            if not nombre or len(nombre) < 4:
-                continue
+        nombre = None
+        # Buscar en el texto del enlace o en elementos cercanos
+        texto_enlace = a.get_text(" ", strip=True)
+        
+        # El nombre suele estar en un span o div dentro del enlace
+        nombre_elem = a.find(["span", "div", "h2", "h3", "h4"], 
+                              class_=re.compile(r"(name|title|nombre)", re.I))
+        if nombre_elem:
+            nombre = nombre_elem.get_text(strip=True)
+        
+        if not nombre and texto_enlace:
+            # Limpiar el texto del enlace (eliminar precios)
+            nombre = re.sub(r"\d+[.,]\d+\s*€.*$", "", texto_enlace).strip()
+        
+        if not nombre or len(nombre) < 4:
+            continue
+        
+        # Limpiar nombre
+        nombre = re.sub(r"\s+", " ", nombre).strip()
         
         # Extraer precio del texto circundante
-        texto_completo = a.get_text(" ", strip=True)
-        # También buscar en el elemento padre si es necesario
+        # Buscar en el elemento padre
         padre = a.find_parent(["div", "article", "li"])
-        if padre:
-            texto_completo = padre.get_text(" ", strip=True)
+        texto_completo = padre.get_text(" ", strip=True) if padre else texto_enlace
         
         precio = extraer_precio(texto_completo)
         if precio is None:
@@ -489,15 +439,22 @@ def parsear_productos_pagina(
             "url":           url_producto,
         })
     
-    # Si no encontramos productos con el patrón /p/, buscar contenedores alternativos
+    # Si no encontramos productos, intentar con contenedores alternativos
     if not productos:
-        contenedores = soup.find_all(["div", "article"], class_=re.compile(r"(product|item|card|producto)", re.I))
+        contenedores = soup.find_all(["div", "article"], class_=re.compile(r"(product|item|card)", re.I))
         
         for contenedor in contenedores:
-            nombre = extraer_nombre(contenedor)
-            if not nombre:
+            # Buscar nombre
+            nombre_elem = contenedor.find(["h2", "h3", "h4", "span"], 
+                                          class_=re.compile(r"(name|title|nombre)", re.I))
+            if not nombre_elem:
                 continue
             
+            nombre = nombre_elem.get_text(strip=True)
+            if not nombre or len(nombre) < 4:
+                continue
+            
+            # Buscar precio
             texto_completo = contenedor.get_text(" ", strip=True)
             precio = extraer_precio(texto_completo)
             if precio is None:
@@ -505,6 +462,7 @@ def parsear_productos_pagina(
             
             precio_kg, unidad_precio = extraer_precio_kg(texto_completo)
             
+            # Buscar enlace
             enlace = contenedor.find("a", href=True)
             url_producto = BASE_URL + enlace["href"] if enlace and enlace["href"].startswith("/") else ""
             
@@ -518,43 +476,31 @@ def parsear_productos_pagina(
                     "url":           url_producto,
                 })
     
-    if not productos and diagnostico:
-        _guardar_diagnostico("productos_no_encontrados", str(soup))
-        log.warning("⚠️ No se encontraron productos en esta página")
-    
     return productos
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PAGINACIÓN
-# ─────────────────────────────────────────────────────────────────────────────
 def get_total_paginas(soup: BeautifulSoup) -> int:
-    """
-    Detecta el número total de páginas.
-    """
-    # Buscar enlaces de paginación
-    patrones_pagina = [
-        r"[?&]page=(\d+)",
-        r"/page/(\d+)",
-    ]
-    
+    """Detecta el número total de páginas."""
     max_page = 0
     for a in soup.find_all("a", href=True):
-        href = a["href"]
-        for patron in patrones_pagina:
-            m = re.search(patron, href)
-            if m:
-                try:
-                    num = int(m.group(1))
-                    max_page = max(max_page, num)
-                except ValueError:
-                    continue
+        m = re.search(r"[?&]page=(\d+)", a["href"])
+        if m:
+            try:
+                num = int(m.group(1))
+                max_page = max(max_page, num)
+            except ValueError:
+                continue
     
-    if max_page > 0:
-        return max_page
+    # También buscar texto como "Página 1 de 3"
+    texto = soup.get_text()
+    m = re.search(r"[Pp]ágina\s+\d+\s+de\s+(\d+)", texto)
+    if m:
+        try:
+            max_page = max(max_page, int(m.group(1)))
+        except ValueError:
+            pass
     
-    # Si no encuentra paginación, asumir 1 página
-    return 1
+    return max_page if max_page > 0 else 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -562,24 +508,26 @@ def get_total_paginas(soup: BeautifulSoup) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 def get_supabase() -> Client:
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError(
-            "Faltan SUPABASE_URL o SUPABASE_KEY. "
-            "Crea un archivo .env o define las variables de entorno."
-        )
+        raise ValueError("Faltan SUPABASE_URL o SUPABASE_KEY en .env")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def cargar_tiendas(sb: Client) -> dict[str, str]:
+def cargar_tienda_mercadona(sb: Client) -> Optional[str]:
+    """Obtiene el ID de la tienda Mercadona en Supabase."""
     try:
-        res = sb.table("tiendas").select("id, nombre").execute()
-        return {r["nombre"]: r["id"] for r in res.data}
+        res = sb.table("tiendas").select("id").eq("nombre", "Mercadona").execute()
+        if res.data:
+            return res.data[0]["id"]
+        else:
+            log.error("Tienda 'Mercadona' no encontrada en Supabase")
+            return None
     except Exception as e:
-        log.error(f"Error cargando tiendas: {e}")
-        return {}
+        log.error(f"Error cargando tienda: {e}")
+        return None
 
 
 def cargar_productos(sb: Client, page_size: int = 1000) -> list[dict]:
-    """Carga paginada para no hacer timeout en catálogos grandes."""
+    """Carga productos existentes para matching fuzzy."""
     todos = []
     offset = 0
     while True:
@@ -596,7 +544,7 @@ def cargar_productos(sb: Client, page_size: int = 1000) -> list[dict]:
                 break
             offset += page_size
         except Exception as e:
-            log.error(f"Error cargando productos (offset={offset}): {e}")
+            log.error(f"Error cargando productos: {e}")
             break
     log.info(f"📦 {len(todos)} productos cargados de Supabase")
     return todos
@@ -631,7 +579,7 @@ def insertar_producto(
             if res.data:
                 return res.data[0]["id"]
         except Exception as e:
-            log.error(f"Error insertando producto '{nombre}' (intento {intento}): {e}")
+            log.error(f"Error insertando producto '{nombre}': {e}")
             time.sleep(1)
     return None
 
@@ -652,16 +600,15 @@ def upsert_precio(sb: Client, producto_id: str, tienda_id: str, precio: float):
             ).execute()
             return
         except Exception as e:
-            log.error(f"Error upsert precio producto_id={producto_id} (intento {intento}): {e}")
+            log.error(f"Error upsert precio: {e}")
             time.sleep(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROCESO DE CATEGORÍA
+# SCRAPER DE CATEGORÍA
 # ─────────────────────────────────────────────────────────────────────────────
 def scrape_categoria(
     sb: Client,
-    cadena_slug: str,
     categoria: dict,
     tienda_id: str,
     productos_db: list[dict],
@@ -670,11 +617,11 @@ def scrape_categoria(
     diagnostico: bool = False,
 ):
     """Procesa todas las páginas de una categoría."""
-    url_base      = categoria["url"]
-    cat_app       = categoria["cat_app"]
-    subcat_nombre = categoria["nombre"]
+    url_base = categoria["url"]
+    cat_app = categoria["cat_app"]
+    nombre_cat = categoria["nombre"]
 
-    log.info(f"  📂 {subcat_nombre} [{cat_app}]")
+    log.info(f"  📂 {nombre_cat} [{cat_app}]")
 
     soup = fetch(url_base, diagnostico=diagnostico)
     if not soup:
@@ -682,39 +629,21 @@ def scrape_categoria(
         return
 
     total_pags = get_total_paginas(soup)
-    log.info(f"     Total páginas: {total_pags}")
+    log.info(f"     Páginas: {total_pags}")
     
     if modo_test:
         total_pags = min(total_pags, 1)
 
-    paginas_vacias_consecutivas = 0
-
     for page_num in range(1, total_pags + 1):
-        # Construir URL de página (formatos comunes)
-        if page_num > 1:
-            url = f"{url_base}?page={page_num}"
-            # Alternativa: /page/2
-            if "?page=" not in url and "/page/" in url_base:
-                url = f"{url_base.rstrip('/')}/page/{page_num}"
-        else:
-            url = url_base
-        
+        url = f"{url_base}?page={page_num}" if page_num > 1 else url_base
         soup_pag = soup if page_num == 1 else fetch(url, diagnostico=diagnostico)
+        
         if not soup_pag:
             stats["paginas_error"] += 1
-            paginas_vacias_consecutivas += 1
-            if paginas_vacias_consecutivas >= 3:
-                log.warning(f"3 páginas consecutivas fallidas en '{subcat_nombre}' — saltando")
-                break
             continue
 
-        items = parsear_productos_pagina(soup_pag, cadena_slug, diagnostico=diagnostico)
+        items = parsear_productos_pagina(soup_pag, diagnostico=diagnostico)
         log.info(f"     Página {page_num}/{total_pags} → {len(items)} productos")
-
-        if not items:
-            paginas_vacias_consecutivas += 1
-        else:
-            paginas_vacias_consecutivas = 0
 
         for item in items:
             stats["procesados"] += 1
@@ -732,7 +661,7 @@ def scrape_categoria(
             else:
                 log.info(f"Nuevo producto: '{item['nombre']}'")
                 producto_id = insertar_producto(
-                    sb, item["nombre"], cat_app, subcat_nombre, tienda_id
+                    sb, item["nombre"], cat_app, nombre_cat, tienda_id
                 )
                 if not producto_id:
                     stats["errores_db"] += 1
@@ -754,14 +683,10 @@ def scrape_categoria(
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-def main(
-    cadenas_seleccionadas: list[str],
-    modo_test: bool = False,
-    diagnostico: bool = False,
-):
+def main(modo_test: bool = False, diagnostico: bool = False):
     inicio_ts = datetime.now()
     log.info("=" * 65)
-    log.info(f"🛒 Scraper RadarSuper v4 — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🛒 Scraper Mercadona — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
     log.info("=" * 65)
 
     try:
@@ -771,12 +696,12 @@ def main(
         log.error(f"❌ {e}")
         sys.exit(1)
 
-    tiendas_map = cargar_tiendas(sb)
-    productos_db = cargar_productos(sb)
-
-    if not tiendas_map:
-        log.error("❌ No se pudieron cargar las tiendas. Abortando.")
+    tienda_id = cargar_tienda_mercadona(sb)
+    if not tienda_id:
+        log.error("❌ No se encontró la tienda Mercadona en Supabase")
         sys.exit(1)
+
+    productos_db = cargar_productos(sb)
 
     stats = {
         "procesados":       0,
@@ -788,38 +713,22 @@ def main(
         "categorias_error": 0,
     }
 
-    for cadena_slug, cadena_nombre in CADENAS.items():
-        if cadena_slug not in cadenas_seleccionadas:
-            continue
+    categorias = CATEGORIAS_MERCADONA
+    
+    if modo_test:
+        categorias = categorias[:3]
+        log.info(f"Modo test: {len(categorias)} categorías")
 
-        tienda_id = tiendas_map.get(cadena_nombre)
-        if not tienda_id:
-            log.warning(f"⚠️ Tienda '{cadena_nombre}' no encontrada en Supabase.")
-            continue
-
-        log.info(f"\n🏪 Procesando {cadena_nombre} ({cadena_slug})...")
-
-        categorias = extraer_categorias(cadena_slug, diagnostico=diagnostico)
-
-        if not categorias:
-            log.error(f"No se encontraron categorías para {cadena_nombre}. Saltando.")
-            continue
-
-        if modo_test:
-            categorias = categorias[:3]
-            log.info(f"Modo test: {len(categorias)} categorías")
-
-        for i, categoria in enumerate(categorias, 1):
-            log.info(f"\n  [{i}/{len(categorias)}] {categoria['nombre']}")
-            scrape_categoria(
-                sb, cadena_slug, categoria, tienda_id,
-                productos_db, stats, modo_test, diagnostico
-            )
-            time.sleep(SLEEP_CATEGORIA)
+    for i, categoria in enumerate(categorias, 1):
+        log.info(f"\n  [{i}/{len(categorias)}] {categoria['nombre']}")
+        scrape_categoria(
+            sb, categoria, tienda_id, productos_db, stats, modo_test, diagnostico
+        )
+        time.sleep(SLEEP_CATEGORIA)
 
     duracion = datetime.now() - inicio_ts
     log.info("=" * 65)
-    log.info(f"✅ Scraper RadarSuper finalizado en {duracion}")
+    log.info(f"✅ Scraper Mercadona finalizado en {duracion}")
     log.info(f"   Productos procesados   : {stats['procesados']}")
     log.info(f"   Precios actualizados   : {stats['actualizados']}")
     log.info(f"   Productos nuevos       : {stats['nuevos']}")
@@ -836,7 +745,7 @@ def main(
             "duracion": str(duracion),
             **stats,
         }
-        Path("scraper_radarsuper_resumen.json").write_text(
+        Path("scraper_mercadona_resumen.json").write_text(
             json.dumps(resumen, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -849,14 +758,7 @@ def main(
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Scraper RadarSuper → Supabase",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--cadena",
-        choices=list(CADENAS.keys()) + ["todas"],
-        default="todas",
-        help="Cadena a procesar (default: todas)",
+        description="Scraper exclusivo para Mercadona en RadarSuper → Supabase",
     )
     parser.add_argument(
         "--test",
@@ -866,14 +768,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--diagnostico",
         action="store_true",
-        help="Guarda el HTML de páginas problemáticas",
+        help="Guarda HTML de páginas problemáticas",
     )
     args = parser.parse_args()
 
-    seleccion = list(CADENAS.keys()) if args.cadena == "todas" else [args.cadena]
-
-    main(
-        cadenas_seleccionadas=seleccion,
-        modo_test=args.test,
-        diagnostico=args.diagnostico,
-    )
+    main(modo_test=args.test, diagnostico=args.diagnostico)
