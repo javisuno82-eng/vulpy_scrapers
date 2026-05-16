@@ -1,6 +1,6 @@
 """
-scraper_radarsuper.py - Versión con cloudscraper y extracción mejorada
-Para ejecutar en GitHub Actions sin necesidad de Chrome
+scraper_radarsuper.py - Versión con curl y cookies persistentes
+Para ejecutar en GitHub Actions sin dependencias pesadas
 """
 
 from __future__ import annotations
@@ -13,11 +13,12 @@ import json
 import logging
 import argparse
 import hashlib
+import subprocess
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-import cloudscraper
 from bs4 import BeautifulSoup
 from thefuzz import fuzz
 from dotenv import load_dotenv
@@ -100,54 +101,82 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP con cloudscraper
+# HTTP CON CURL (con cookies persistentes)
 # ─────────────────────────────────────────────────────────────────────────────
-_scraper = None
+_cookie_jar = None
 
-def get_scraper() -> cloudscraper.CloudScraper:
-    global _scraper
-    if _scraper is None:
-        log.info("🚀 Inicializando cloudscraper...")
-        _scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
-        )
-        log.info("✅ cloudscraper listo")
-    return _scraper
+def get_cookie_jar():
+    """Obtiene o crea un archivo temporal para las cookies."""
+    global _cookie_jar
+    if _cookie_jar is None:
+        _cookie_jar = tempfile.NamedTemporaryFile(delete=False)
+        log.info(f"🍪 Cookie jar creada: {_cookie_jar.name}")
+    return _cookie_jar.name
+
+
+def fetch_with_curl(url: str, diagnostico: bool = False) -> Optional[str]:
+    """Usa curl con cookies persistentes para simular navegador real."""
+    cookie_jar_path = get_cookie_jar()
+    
+    cmd = [
+        'curl', '-s', '-L',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        '--cookie-jar', cookie_jar_path,
+        '--cookie', cookie_jar_path,
+        '--retry', '3',
+        '--retry-delay', '2',
+        '--connect-timeout', '30',
+        '--max-time', '60',
+        '--compressed',
+        '--header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        '--header', 'Accept-Language: es-ES,es;q=0.9',
+        '--header', 'Accept-Encoding: gzip, deflate, br',
+        '--header', 'Connection: keep-alive',
+        '--header', 'Upgrade-Insecure-Requests: 1',
+        '--header', 'Sec-Fetch-Dest: document',
+        '--header', 'Sec-Fetch-Mode: navigate',
+        '--header', 'Sec-Fetch-Site: none',
+        '--header', 'Sec-Fetch-User: ?1',
+        url
+    ]
+    
+    try:
+        log.debug(f"🌐 curl: {url}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        
+        if result.returncode == 0 and len(result.stdout) > 500:
+            html = result.stdout
+            
+            # Verificar si Cloudflare nos bloqueó
+            if "Attention Required" in html or "cf-challenge" in html or "cf-browser-verification" in html:
+                log.warning(f"⚠️ Cloudflare challenge detectado en {url}")
+                if diagnostico:
+                    _guardar_diagnostico(url, html)
+                return None
+            
+            return html
+        else:
+            log.error(f"curl error: returncode={result.returncode}, stdout_len={len(result.stdout)}")
+            return None
+            
+    except subprocess.TimeoutExpired:
+        log.error(f"Timeout en curl para {url}")
+        return None
+    except Exception as e:
+        log.error(f"curl exception: {e}")
+        return None
 
 
 def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
-    """Descarga una página usando cloudscraper."""
-    try:
-        scraper = get_scraper()
-        
-        log.debug(f"Cargando: {url}")
-        response = scraper.get(url, timeout=30)
-        
-        if response.status_code != 200:
-            log.error(f"Error {response.status_code} en {url}")
-            return None
-        
-        html = response.text
-        
-        # Verificar si Cloudflare nos bloqueó
-        if "Attention Required" in html or "cf-challenge" in html:
-            log.error(f"❌ Cloudflare bloqueó la página: {url}")
-            if diagnostico:
-                _guardar_diagnostico(url, html)
-            return None
-        
-        if diagnostico:
-            _guardar_diagnostico(url, html)
-        
-        return BeautifulSoup(html, 'html.parser')
-        
-    except Exception as e:
-        log.error(f"Error fetching {url}: {e}")
+    """Descarga una página usando curl."""
+    html = fetch_with_curl(url, diagnostico=diagnostico)
+    if html is None:
         return None
+    
+    if diagnostico:
+        _guardar_diagnostico(url, html)
+    
+    return BeautifulSoup(html, 'html.parser')
 
 
 def _guardar_diagnostico(url: str, html: str):
@@ -174,6 +203,8 @@ def extraer_precio(texto: str) -> Optional[float]:
         r"(\d{1,4}[.,]\d{2})\s*EUR",
         r"(\d{1,4}[.,]\d{2})\s*€\s*$",
         r"^(\d{1,4}[.,]\d{2})\s*€",
+        r'data-price=["\']?(\d{1,4}[.,]\d{2})',
+        r'content=["\'](\d{1,4}[.,]\d{2})',
     ]
     for patron in patrones:
         m = re.search(patron, texto, re.IGNORECASE)
@@ -193,6 +224,7 @@ def extraer_precio_kg(texto: str) -> tuple[Optional[float], Optional[str]]:
         r"(\d{1,4}[.,]\d+)\s*€\s*/\s*(kg|Kg|K|L|l|lt|ud|unidad)",
         r"(\d{1,4}[.,]\d+)\s*€/(kg|l|ud)",
         r"(\d{1,4}[.,]\d+)\s*(?:€/kg|€/l|€/ud)",
+        r"(\d{1,4}[.,]\d+)\s*(?:€|€)\s*(?:por|el)\s*(kg|l|ud)",
     ]
     for patron in patrones:
         m = re.search(patron, texto, re.IGNORECASE)
@@ -200,7 +232,7 @@ def extraer_precio_kg(texto: str) -> tuple[Optional[float], Optional[str]]:
             try:
                 valor = float(m.group(1).replace(",", "."))
                 unidad = m.group(2).lower() if len(m.groups()) > 1 else "kg"
-                unidad = {"kilo": "kg", "litro": "L", "lt": "L", "l": "L"}.get(unidad, unidad)
+                unidad = {"kilo": "kg", "litro": "L", "lt": "L", "l": "L", "unidad": "ud"}.get(unidad, unidad)
                 if 0.01 <= valor <= 9999.0:
                     return valor, unidad
             except ValueError:
@@ -257,16 +289,33 @@ def extraer_categorias(cadena_slug: str, diagnostico: bool = False) -> list[dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACCIÓN DE PRODUCTOS - VERSIÓN MEJORADA
+# EXTRACCIÓN DE PRODUCTOS
 # ─────────────────────────────────────────────────────────────────────────────
 def parsear_productos_pagina(soup: BeautifulSoup, diagnostico: bool = False) -> list[dict]:
     """Extrae productos de una página de categoría usando múltiples estrategias."""
     productos = []
     vistos = set()
     
+    # Mostrar estructura para diagnóstico
+    if diagnostico:
+        # Buscar cualquier enlace que contenga /p/
+        enlaces_p = [a.get("href", "") for a in soup.find_all("a", href=True) if "/p/" in a.get("href", "")]
+        if enlaces_p:
+            log.info(f"   🔍 Enlaces /p/ encontrados: {len(enlaces_p)}")
+            for href in enlaces_p[:3]:
+                log.info(f"      - {href}")
+        else:
+            log.warning("   🔍 No se encontraron enlaces con /p/")
+        
+        # Buscar precios en el texto
+        texto_pagina = soup.get_text()
+        precios = re.findall(r"\d+[.,]\d+\s*€", texto_pagina)
+        if precios:
+            log.info(f"   🔍 Precios encontrados en texto: {precios[:3]}")
+    
     # ESTRATEGIA 1: Buscar elementos con clase "product", "item" o "card"
     contenedores = soup.find_all(["div", "article", "li"], 
-                                  class_=re.compile(r"(product|item|card|producto|result)", re.I))
+                                  class_=re.compile(r"(product|item|card|producto|result|product-card)", re.I))
     
     for contenedor in contenedores:
         # Buscar enlace a producto
@@ -362,7 +411,7 @@ def parsear_productos_pagina(soup: BeautifulSoup, diagnostico: bool = False) -> 
                 "url": url_producto,
             })
     
-    # ESTRATEGIA 3: Buscar cualquier enlace que contenga precio y no sea categoría
+    # ESTRATEGIA 3: Buscar cualquier enlace que contenga precio
     if not productos:
         log.debug("Estrategia 2 no encontró productos, probando estrategia 3...")
         
@@ -395,23 +444,8 @@ def parsear_productos_pagina(soup: BeautifulSoup, diagnostico: bool = False) -> 
                 "url": url_producto,
             })
     
-    # Diagnóstico: si no se encontraron productos, guardar información útil
     if not productos and diagnostico:
-        _guardar_diagnostico("productos_no_encontrados", str(soup)[:500000])
-        log.warning("⚠️ NO se encontraron productos - estructura desconocida")
-        
-        # Mostrar ejemplos de enlaces para depuración
-        enlaces_p = [a.get("href", "") for a in soup.find_all("a", href=True) if "/p/" in a.get("href", "")]
-        if enlaces_p:
-            log.warning(f"   Ejemplos de enlaces /p/ encontrados: {enlaces_p[:3]}")
-        else:
-            log.warning("   No se encontraron enlaces con /p/")
-        
-        # Mostrar ejemplos de precios encontrados
-        texto_pagina = soup.get_text()
-        precios_encontrados = re.findall(r"\d+[.,]\d+\s*€", texto_pagina)
-        if precios_encontrados:
-            log.warning(f"   Ejemplos de precios encontrados: {precios_encontrados[:3]}")
+        log.warning("⚠️ NO se encontraron productos - revisa el HTML guardado")
     
     return productos
 
@@ -593,7 +627,7 @@ def scrape_categoria(
 def main(cadena_seleccionada: Optional[str] = None, modo_test: bool = False, diagnostico: bool = False):
     inicio_ts = datetime.now()
     log.info("=" * 65)
-    log.info(f"🛒 Scraper RadarSuper (cloudscraper) — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🛒 Scraper RadarSuper (curl) — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
     log.info("=" * 65)
 
     try:
@@ -675,7 +709,7 @@ def main(cadena_seleccionada: Optional[str] = None, modo_test: bool = False, dia
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scraper RadarSuper con cloudscraper")
+    parser = argparse.ArgumentParser(description="Scraper RadarSuper con curl")
     parser.add_argument("--cadena", choices=list(CADENAS_SOPORTADAS.keys()) + ["todas"], 
                         default="mercadona", help="Cadena a procesar")
     parser.add_argument("--test", action="store_true", help="Modo test (3 categorías, 1 página)")
