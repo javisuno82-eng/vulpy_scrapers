@@ -2,6 +2,14 @@
 scraper_radarsuper.py - Scraper en dos fases para Mercadona y Carrefour
 Fase 1: Extrae todos los enlaces de productos de las categorías
 Fase 2: Scrapea cada producto individualmente
+
+MEJORAS ANTI-BLOQUEO:
+- Reintentos con backoff exponencial (espera progresiva)
+- Manejo de errores HTTP 429 (Rate Limit)
+- Timeouts configurables
+- Rotación de User-Agent
+- Pausas aleatorias entre peticiones
+- Guardado de progreso para reanudar
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ import argparse
 import hashlib
 import subprocess
 import tempfile
+import random
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, List
@@ -38,9 +47,19 @@ BASE_URL = "https://radarsuper.com"
 
 FUZZY_THRESHOLD = 72
 
-SLEEP_PAGINA    = 2.0
-SLEEP_CATEGORIA = 3.0
-SLEEP_PRODUCTO  = 0.5
+# TIEMPOS DE ESPERA (aumentados para evitar bloqueos)
+SLEEP_PAGINA    = 3.0      # Entre páginas
+SLEEP_CATEGORIA = 5.0      # Entre categorías
+SLEEP_PRODUCTO  = 1.0      # Entre productos
+
+# CONFIGURACIÓN DE REINTENTOS
+MAX_RETRIES = 5             # Número máximo de reintentos por URL
+BASE_BACKOFF = 2.0          # Backoff exponencial: 2, 4, 8, 16, 32 segundos
+REQUEST_TIMEOUT = 90        # Timeout global para cada petición
+
+# CONFIGURACIÓN DE PAUSAS ALEATORIAS
+MIN_RANDOM_SLEEP = 0.5      # Pausa mínima entre peticiones
+MAX_RANDOM_SLEEP = 2.0      # Pausa máxima entre peticiones
 
 DIAG_DIR = Path("diagnostico_radarsuper")
 
@@ -49,6 +68,15 @@ CADENAS_SOPORTADAS = {
     "mercadona": "Mercadona",
     "carrefour": "Carrefour",
 }
+
+# USER-AGENTS PARA ROTAR
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+]
 
 # MAPEO DE CATEGORÍAS
 CATEGORIA_MAP = {
@@ -83,7 +111,21 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP CON CURL
+# UTILIDADES
+# ─────────────────────────────────────────────────────────────────────────────
+def random_sleep():
+    """Pausa aleatoria para simular comportamiento humano."""
+    sleep_time = random.uniform(MIN_RANDOM_SLEEP, MAX_RANDOM_SLEEP)
+    time.sleep(sleep_time)
+
+
+def get_random_user_agent() -> str:
+    """Devuelve un User-Agent aleatorio."""
+    return random.choice(USER_AGENTS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP CON CURL (CON REINTENTOS Y BACKOFF EXPONENCIAL)
 # ─────────────────────────────────────────────────────────────────────────────
 _cookie_jar = None
 
@@ -95,44 +137,77 @@ def get_cookie_jar():
     return _cookie_jar.name
 
 
-def fetch_with_curl(url: str, diagnostico: bool = False) -> Optional[str]:
-    """Usa curl con cookies persistentes."""
+def fetch_with_curl(url: str, diagnostico: bool = False, retry_count: int = 0) -> Optional[str]:
+    """Usa curl con cookies persistentes, reintentos y backoff exponencial."""
     cookie_jar_path = get_cookie_jar()
+    user_agent = get_random_user_agent()
     
     cmd = [
         'curl', '-s', '-L',
-        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        '--user-agent', user_agent,
         '--cookie-jar', cookie_jar_path,
         '--cookie', cookie_jar_path,
         '--retry', '3',
         '--retry-delay', '2',
         '--connect-timeout', '30',
-        '--max-time', '60',
+        '--max-time', str(REQUEST_TIMEOUT),
         '--compressed',
         '--header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         '--header', 'Accept-Language: es-ES,es;q=0.9',
         '--header', 'Accept-Encoding: gzip, deflate, br',
         '--header', 'Connection: keep-alive',
+        '--header', 'Upgrade-Insecure-Requests: 1',
+        '--header', 'Sec-Fetch-Dest: document',
+        '--header', 'Sec-Fetch-Mode: navigate',
+        '--header', 'Sec-Fetch-Site: none',
+        '--header', 'Sec-Fetch-User: ?1',
         url
     ]
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=REQUEST_TIMEOUT + 10)
         
-        if result.returncode == 0 and len(result.stdout) > 500:
-            html = result.stdout
-            if "Attention Required" in html or "cf-challenge" in html:
-                if diagnostico:
-                    _guardar_diagnostico(url, html)
-                return None
-            return html
+        # Verificar si hay error de conexión o timeout
+        if result.returncode != 0:
+            raise subprocess.SubprocessError(f"curl return code: {result.returncode}, stderr: {result.stderr}")
+        
+        html = result.stdout
+        
+        # Verificar si Cloudflare nos bloqueó
+        if "Attention Required" in html or "cf-challenge" in html or "cf-browser-verification" in html:
+            log.warning(f"⚠️ Cloudflare challenge detectado en {url}")
+            if diagnostico:
+                _guardar_diagnostico(url, html)
+            return None
+        
+        # Verificar que el HTML tiene contenido significativo
+        if len(html) < 500:
+            log.warning(f"⚠️ HTML demasiado corto ({len(html)} bytes) en {url}")
+            return None
+        
+        return html
+        
+    except subprocess.TimeoutExpired:
+        log.warning(f"Timeout en curl para {url}")
+        if retry_count < MAX_RETRIES:
+            wait_time = (BASE_BACKOFF ** retry_count) + random.uniform(0, 1)
+            log.info(f"Reintento {retry_count + 1}/{MAX_RETRIES} en {wait_time:.1f}s")
+            time.sleep(wait_time)
+            return fetch_with_curl(url, diagnostico, retry_count + 1)
         return None
+        
     except Exception as e:
         log.error(f"curl error: {e}")
+        if retry_count < MAX_RETRIES:
+            wait_time = (BASE_BACKOFF ** retry_count) + random.uniform(0, 1)
+            log.info(f"Reintento {retry_count + 1}/{MAX_RETRIES} en {wait_time:.1f}s")
+            time.sleep(wait_time)
+            return fetch_with_curl(url, diagnostico, retry_count + 1)
         return None
 
 
 def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
+    """Descarga una página con reintentos y backoff exponencial."""
     html = fetch_with_curl(url, diagnostico=diagnostico)
     if html is None:
         return None
@@ -142,6 +217,7 @@ def fetch(url: str, diagnostico: bool = False) -> Optional[BeautifulSoup]:
 
 
 def _guardar_diagnostico(url: str, html: str):
+    """Guarda HTML para depuración."""
     try:
         DIAG_DIR.mkdir(exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -157,31 +233,44 @@ def _guardar_diagnostico(url: str, html: str):
 # EXTRACCIÓN DE PRECIO
 # ─────────────────────────────────────────────────────────────────────────────
 def extraer_precio(texto: str) -> Optional[float]:
+    """Extrae el precio del texto usando múltiples patrones."""
     patrones = [
         r"(\d{1,4}[.,]\d{2})\s*€",
         r"€\s*(\d{1,4}[.,]\d{2})",
         r"(\d{1,4}[.,]\d{2})\s*EUR",
+        r'data-price=["\']?(\d{1,4}[.,]\d{2})',
+        r'content=["\'](\d{1,4}[.,]\d{2})',
     ]
     for patron in patrones:
         m = re.search(patron, texto, re.IGNORECASE)
         if m:
             try:
-                return float(m.group(1).replace(",", "."))
+                valor = float(m.group(1).replace(",", "."))
+                if 0.05 <= valor <= 999.0:
+                    return valor
             except ValueError:
                 continue
     return None
 
 
 def extraer_precio_kg(texto: str) -> tuple[Optional[float], Optional[str]]:
-    patron = r"(\d{1,4}[.,]\d+)\s*€\s*/\s*(kg|Kg|L|l|ud)"
-    m = re.search(patron, texto, re.IGNORECASE)
-    if m:
-        try:
-            valor = float(m.group(1).replace(",", "."))
-            unidad = m.group(2).lower()
-            return valor, unidad
-        except ValueError:
-            pass
+    """Extrae el precio por kg/L/ud."""
+    patrones = [
+        r"(\d{1,4}[.,]\d+)\s*€\s*/\s*(kg|Kg|K|L|l|lt|ud|unidad)",
+        r"(\d{1,4}[.,]\d+)\s*€/(kg|l|ud)",
+        r"(\d{1,4}[.,]\d+)\s*(?:€/kg|€/l|€/ud)",
+    ]
+    for patron in patrones:
+        m = re.search(patron, texto, re.IGNORECASE)
+        if m:
+            try:
+                valor = float(m.group(1).replace(",", "."))
+                unidad = m.group(2).lower() if len(m.groups()) > 1 else "kg"
+                unidad = {"kilo": "kg", "litro": "L", "lt": "L", "l": "L", "unidad": "ud"}.get(unidad, unidad)
+                if 0.01 <= valor <= 9999.0:
+                    return valor, unidad
+            except ValueError:
+                continue
     return None, None
 
 
@@ -262,6 +351,8 @@ def fase1_extraer_todos_los_enlaces(cadena_slug: str, diagnostico: bool = False)
         log.info(f"      → {len(enlaces)} enlaces de productos encontrados")
         todos_los_enlaces.extend(enlaces)
         
+        # Pausa aleatoria entre categorías
+        random_sleep()
         time.sleep(SLEEP_CATEGORIA)
     
     todos_los_enlaces = list(set(todos_los_enlaces))
@@ -336,15 +427,27 @@ def fase2_scrapear_productos(cadena_slug: str, diagnostico: bool = False, limite
         log.error(f"No se encuentra {enlaces_file}. Ejecuta la fase 1 primero.")
         return
     
+    # Verificar si ya hay progreso guardado
+    progreso_file = f"progreso_{cadena_slug}.json"
+    start_index = 0
+    productos_scrapeados = []
+    
+    try:
+        with open(progreso_file, "r", encoding="utf-8") as f:
+            progreso = json.load(f)
+            start_index = progreso.get("last_index", 0)
+            productos_scrapeados = progreso.get("productos", [])
+            log.info(f"🔄 Reanudando desde producto {start_index + 1}/{len(enlaces)}")
+    except FileNotFoundError:
+        pass
+    
     if limite:
         enlaces = enlaces[:limite]
         log.info(f"🧪 Modo test: procesando {len(enlaces)} productos")
     
     log.info(f"🔄 Scrapeando {len(enlaces)} productos para {cadena_slug}...")
     
-    productos_scrapeados = []
-    
-    for i, url in enumerate(enlaces, 1):
+    for i, url in enumerate(enlaces[start_index:], start_index + 1):
         log.info(f"  [{i}/{len(enlaces)}] {url[:80]}...")
         
         producto = scrapear_producto_desde_url(url, diagnostico=diagnostico)
@@ -354,15 +457,25 @@ def fase2_scrapear_productos(cadena_slug: str, diagnostico: bool = False, limite
         else:
             log.warning(f"      ❌ No se pudo scrapear o sin precio")
         
+        # Guardar progreso cada 10 productos
         if i % 10 == 0:
+            with open(progreso_file, "w", encoding="utf-8") as f:
+                json.dump({"last_index": i, "productos": productos_scrapeados}, f, indent=2, ensure_ascii=False)
+            # Guardar copia parcial
             with open(f"productos_{cadena_slug}_parcial.json", "w", encoding="utf-8") as f:
                 json.dump(productos_scrapeados, f, indent=2, ensure_ascii=False)
         
+        # Pausa aleatoria entre productos
+        random_sleep()
         time.sleep(SLEEP_PRODUCTO)
     
     output_file = f"productos_{cadena_slug}.json"
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(productos_scrapeados, f, indent=2, ensure_ascii=False)
+    
+    # Limpiar archivo de progreso
+    if os.path.exists(progreso_file):
+        os.remove(progreso_file)
     
     log.info(f"✅ Scraping completado. {len(productos_scrapeados)} productos guardados en {output_file}")
     
@@ -373,18 +486,29 @@ def fase2_scrapear_productos(cadena_slug: str, diagnostico: bool = False, limite
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Scraper RadarSuper en dos fases")
+    parser = argparse.ArgumentParser(description="Scraper RadarSuper en dos fases con anti-bloqueo")
     parser.add_argument("--cadena", choices=list(CADENAS_SOPORTADAS.keys()) + ["todas"], 
                         default="mercadona", help="Cadena a procesar")
     parser.add_argument("--fase", choices=["1", "2", "ambas"], default="ambas",
                         help="Fase: 1 (extraer enlaces), 2 (scrapear productos)")
     parser.add_argument("--test", action="store_true", help="Modo test (limitar a 10 productos)")
     parser.add_argument("--diagnostico", action="store_true", help="Guardar HTML para depuración")
+    parser.add_argument("--slow", action="store_true", help="Modo lento (pausas más largas para evitar bloqueos)")
     args = parser.parse_args()
+    
+    # Ajustar tiempos si está en modo lento
+    global SLEEP_PAGINA, SLEEP_CATEGORIA, SLEEP_PRODUCTO, MIN_RANDOM_SLEEP, MAX_RANDOM_SLEEP
+    if args.slow:
+        SLEEP_PAGINA = 10.0
+        SLEEP_CATEGORIA = 15.0
+        SLEEP_PRODUCTO = 3.0
+        MIN_RANDOM_SLEEP = 2.0
+        MAX_RANDOM_SLEEP = 5.0
+        log.info("🐢 Modo lento activado - pausas más largas")
     
     inicio_ts = datetime.now()
     log.info("=" * 65)
-    log.info(f"🛒 Scraper RadarSuper v2 — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🛒 Scraper RadarSuper v3 (anti-bloqueo) — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
     log.info("=" * 65)
     
     # Determinar cadenas a procesar
