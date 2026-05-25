@@ -10,6 +10,10 @@ MEJORAS ANTI-BLOQUEO:
 - Rotación de User-Agent
 - Pausas aleatorias entre peticiones
 - Guardado de progreso para reanudar
+
+PROTECCIÓN DE DATOS:
+- Respeta tickets de usuarios (no machaca precios de tickets recientes)
+- Los tickets de los últimos 7 días tienen prioridad
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ import hashlib
 import subprocess
 import tempfile
 import random
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
 
@@ -60,6 +64,9 @@ REQUEST_TIMEOUT = 90        # Timeout global para cada petición
 # CONFIGURACIÓN DE PAUSAS ALEATORIAS
 MIN_RANDOM_SLEEP = 0.5      # Pausa mínima entre peticiones
 MAX_RANDOM_SLEEP = 2.0      # Pausa máxima entre peticiones
+
+# PROTECCIÓN DE TICKETS: días que un ticket es considerado "reciente"
+DIAS_TICKET_RECIENTE = 7
 
 DIAG_DIR = Path("diagnostico_radarsuper")
 
@@ -230,6 +237,100 @@ def _guardar_diagnostico(url: str, html: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SUPABASE - PROTECCIÓN DE TICKETS
+# ─────────────────────────────────────────────────────────────────────────────
+_sb_client = None
+
+def get_supabase() -> Client:
+    global _sb_client
+    if _sb_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError("Faltan SUPABASE_URL o SUPABASE_KEY en el .env")
+        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _sb_client
+
+
+def tiene_ticket_reciente(producto_id: str, tienda_id: str, ciudad: str) -> bool:
+    """Verifica si existe un precio de tipo 'ticket' en los últimos DIAS_TICKET_RECIENTE días."""
+    try:
+        sb = get_supabase()
+        fecha_limite = (datetime.now() - timedelta(days=DIAS_TICKET_RECIENTE)).date().isoformat()
+        
+        result = sb.table('precios')\
+            .select('id')\
+            .eq('producto_id', producto_id)\
+            .eq('tienda_id', tienda_id)\
+            .eq('fuente', 'ticket')\
+            .gte('fecha', fecha_limite)\
+            .limit(1)\
+            .execute()
+        
+        return len(result.data) > 0
+    except Exception as e:
+        log.warning(f"⚠️ Error verificando ticket reciente: {e}")
+        return False
+
+
+def buscar_producto_id(nombre_producto: str, sb: Client) -> Optional[str]:
+    """Busca el ID de un producto por nombre."""
+    try:
+        result = sb.table('productos')\
+            .select('id, nombre')\
+            .ilike('nombre', f'%{nombre_producto}%')\
+            .limit(1)\
+            .execute()
+        
+        if result.data:
+            return result.data[0]['id']
+        return None
+    except Exception as e:
+        log.warning(f"⚠️ Error buscando producto: {e}")
+        return None
+
+
+def buscar_tienda_id(nombre_tienda: str, sb: Client) -> Optional[str]:
+    """Busca el ID de una tienda por nombre."""
+    try:
+        result = sb.table('tiendas')\
+            .select('id')\
+            .eq('nombre', nombre_tienda)\
+            .limit(1)\
+            .execute()
+        
+        if result.data:
+            return result.data[0]['id']
+        return None
+    except Exception as e:
+        log.warning(f"⚠️ Error buscando tienda: {e}")
+        return None
+
+
+def upsert_precio_protegido(producto_id: str, tienda_id: str, precio: float, ciudad: str, fuente: str = 'radarsuper') -> bool:
+    """Inserta o actualiza el precio, respetando tickets recientes."""
+    
+    # Verificar si hay un ticket reciente
+    if tiene_ticket_reciente(producto_id, tienda_id, ciudad):
+        log.info(f"⚠️ Saltando actualización: existe ticket reciente (últimos {DIAS_TICKET_RECIENTE} días)")
+        return False
+    
+    try:
+        sb = get_supabase()
+        sb.table('precios').upsert({
+            'producto_id': producto_id,
+            'tienda_id': tienda_id,
+            'ciudad': ciudad,
+            'precio': precio,
+            'fecha': str(date.today()),
+            'fuente': fuente,
+        }, on_conflict="producto_id,tienda_id,ciudad,fecha").execute()
+        log.info(f"✅ Precio actualizado: {precio}€ para producto {producto_id}")
+        return True
+    except Exception as e:
+        log.error(f"❌ Error insertando precio: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EXTRACCIÓN DE PRECIO
 # ─────────────────────────────────────────────────────────────────────────────
 def extraer_precio(texto: str) -> Optional[float]:
@@ -367,7 +468,7 @@ def fase1_extraer_todos_los_enlaces(cadena_slug: str, diagnostico: bool = False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASE 2: SCRAPEAR PRODUCTOS
+# FASE 2: SCRAPEAR PRODUCTOS Y SUBIR A SUPABASE
 # ─────────────────────────────────────────────────────────────────────────────
 def scrapear_producto_desde_url(url: str, diagnostico: bool = False) -> Optional[dict]:
     """Extrae datos de un producto desde su URL individual."""
@@ -416,8 +517,47 @@ def scrapear_producto_desde_url(url: str, diagnostico: bool = False) -> Optional
         return None
 
 
+def procesar_y_subir_producto(producto: dict, sb: Client) -> bool:
+    """Procesa un producto y lo sube a Supabase respetando tickets recientes."""
+    try:
+        nombre_producto = producto.get("nombre", "")
+        precio = producto.get("precio")
+        cadena = producto.get("cadena")
+        
+        if not nombre_producto or not precio or not cadena:
+            log.warning(f"⚠️ Producto incompleto: {nombre_producto}")
+            return False
+        
+        # Buscar o crear producto
+        producto_id = buscar_producto_id(nombre_producto, sb)
+        if not producto_id:
+            # Insertar nuevo producto
+            result = sb.table('productos').insert({
+                'nombre': nombre_producto,
+                'verificado': False,
+            }).execute()
+            if result.data:
+                producto_id = result.data[0]['id']
+                log.info(f"➕ Producto creado: {nombre_producto[:50]}")
+            else:
+                return False
+        
+        # Buscar tienda
+        tienda_id = buscar_tienda_id(cadena, sb)
+        if not tienda_id:
+            log.warning(f"⚠️ Tienda no encontrada: {cadena}")
+            return False
+        
+        # Subir precio con protección de tickets
+        return upsert_precio_protegido(producto_id, tienda_id, precio, CIUDAD_SCRAPER, 'radarsuper')
+        
+    except Exception as e:
+        log.error(f"❌ Error procesando producto: {e}")
+        return False
+
+
 def fase2_scrapear_productos(cadena_slug: str, diagnostico: bool = False, limite: int = None):
-    """Fase 2: Scrapea cada producto individualmente desde los enlaces guardados."""
+    """Fase 2: Scrapea cada producto individualmente y sube a Supabase."""
     enlaces_file = f"enlaces_{cadena_slug}.json"
     
     try:
@@ -427,16 +567,19 @@ def fase2_scrapear_productos(cadena_slug: str, diagnostico: bool = False, limite
         log.error(f"No se encuentra {enlaces_file}. Ejecuta la fase 1 primero.")
         return
     
+    # Conectar a Supabase
+    sb = get_supabase()
+    
     # Verificar si ya hay progreso guardado
     progreso_file = f"progreso_{cadena_slug}.json"
     start_index = 0
-    productos_scrapeados = []
+    productos_procesados = 0
     
     try:
         with open(progreso_file, "r", encoding="utf-8") as f:
             progreso = json.load(f)
             start_index = progreso.get("last_index", 0)
-            productos_scrapeados = progreso.get("productos", [])
+            productos_procesados = progreso.get("procesados", 0)
             log.info(f"🔄 Reanudando desde producto {start_index + 1}/{len(enlaces)}")
     except FileNotFoundError:
         pass
@@ -452,34 +595,31 @@ def fase2_scrapear_productos(cadena_slug: str, diagnostico: bool = False, limite
         
         producto = scrapear_producto_desde_url(url, diagnostico=diagnostico)
         if producto and producto["precio"]:
-            productos_scrapeados.append(producto)
-            log.info(f"      ✅ {producto['nombre'][:50]} - {producto['precio']}€")
+            success = procesar_y_subir_producto(producto, sb)
+            if success:
+                productos_procesados += 1
+                log.info(f"      ✅ {producto['nombre'][:50]} - {producto['precio']}€")
+            else:
+                log.warning(f"      ⚠️ No se pudo subir (posible ticket reciente)")
         else:
             log.warning(f"      ❌ No se pudo scrapear o sin precio")
         
         # Guardar progreso cada 10 productos
         if i % 10 == 0:
             with open(progreso_file, "w", encoding="utf-8") as f:
-                json.dump({"last_index": i, "productos": productos_scrapeados}, f, indent=2, ensure_ascii=False)
-            # Guardar copia parcial
-            with open(f"productos_{cadena_slug}_parcial.json", "w", encoding="utf-8") as f:
-                json.dump(productos_scrapeados, f, indent=2, ensure_ascii=False)
+                json.dump({"last_index": i, "procesados": productos_procesados}, f, indent=2, ensure_ascii=False)
         
         # Pausa aleatoria entre productos
         random_sleep()
         time.sleep(SLEEP_PRODUCTO)
     
-    output_file = f"productos_{cadena_slug}.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(productos_scrapeados, f, indent=2, ensure_ascii=False)
-    
     # Limpiar archivo de progreso
     if os.path.exists(progreso_file):
         os.remove(progreso_file)
     
-    log.info(f"✅ Scraping completado. {len(productos_scrapeados)} productos guardados en {output_file}")
+    log.info(f"✅ Scraping completado. {productos_procesados} productos subidos a Supabase")
     
-    return productos_scrapeados
+    return productos_procesados
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,7 +648,8 @@ def main():
     
     inicio_ts = datetime.now()
     log.info("=" * 65)
-    log.info(f"🛒 Scraper RadarSuper v3 (anti-bloqueo) — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🛒 Scraper RadarSuper v3 (anti-bloqueo + protección tickets) — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🔒 Protección de tickets: últimos {DIAS_TICKET_RECIENTE} días")
     log.info("=" * 65)
     
     # Determinar cadenas a procesar
@@ -525,7 +666,7 @@ def main():
             fase1_extraer_todos_los_enlaces(cadena_slug, diagnostico=args.diagnostico)
         
         if args.fase in ["2", "ambas"]:
-            log.info(f"\n📌 FASE 2: Scrapeando productos individualmente...")
+            log.info(f"\n📌 FASE 2: Scrapeando productos y subiendo a Supabase...")
             limite = 10 if args.test else None
             fase2_scrapear_productos(cadena_slug, diagnostico=args.diagnostico, limite=limite)
     
