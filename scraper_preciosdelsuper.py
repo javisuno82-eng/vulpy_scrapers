@@ -10,6 +10,10 @@ MEJORAS DE ROBUSTEZ v3:
   - Pausas aleatorias entre peticiones
   - Guardado de progreso para reanudar
   - Timeout global por página (evita que se cuelgue)
+
+PROTECCIÓN DE DATOS v4:
+  - Respeta tickets de usuarios (no machaca precios de tickets recientes)
+  - Los tickets de los últimos 7 días tienen prioridad
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import hashlib
 import json
 import random
 import signal
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -63,6 +67,9 @@ PAGINA_TIMEOUT = 60            # Timeout máximo por página
 # Reintentos de red
 MAX_REINTENTOS = 5
 BACKOFF_BASE = 2.0
+
+# PROTECCIÓN DE TICKETS: días que un ticket es considerado "reciente"
+DIAS_TICKET_RECIENTE = 7
 
 # Carpeta donde se guardan HTMLs de diagnóstico y progreso
 DIAG_DIR = Path("diagnostico_scraper")
@@ -135,13 +142,12 @@ def timeout_handler(signum, frame):
 
 def fetch_page_with_timeout(url: str, timeout_seconds: int = PAGINA_TIMEOUT):
     """Descarga una página con timeout global."""
-    # Configurar señal de timeout
     signal.signal(signal.SIGALRM, timeout_handler)
     signal.alarm(timeout_seconds)
     
     try:
         result = fetch_page(url)
-        signal.alarm(0)  # Cancelar timeout
+        signal.alarm(0)
         return result
     except TimeoutError:
         log.error(f"⏰ TIMEOUT GLOBAL: La página {url} excedió {timeout_seconds}s")
@@ -191,7 +197,6 @@ def fetch_page(url: str, diagnostico: bool = False, retry_count: int = 0) -> Opt
     for intento in range(1, MAX_REINTENTOS + 1):
         _sesion.headers["User-Agent"] = _siguiente_ua()
         try:
-            # Timeout crítico para evitar que se cuelgue
             r = _sesion.get(url, timeout=(5, REQUEST_TIMEOUT))
 
             if r.status_code == 429:
@@ -393,7 +398,6 @@ def get_total_paginas(soup: BeautifulSoup) -> int:
     if max_page > 0:
         return max_page
 
-    # Buscar texto como "Página 1 de X"
     texto = soup.get_text()
     m = re.search(r"[Pp]ágina\s+\d+\s+[Dd]e\s+(\d+)", texto)
     if m:
@@ -460,12 +464,17 @@ def parsear_pagina(soup: BeautifulSoup, diagnostico: bool = False) -> list[dict]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUPABASE
+# SUPABASE - PROTECCIÓN DE TICKETS
 # ─────────────────────────────────────────────────────────────────────────────
+_sb_client = None
+
 def get_supabase() -> Client:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError("Faltan SUPABASE_URL o SUPABASE_KEY en .env")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    global _sb_client
+    if _sb_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError("Faltan SUPABASE_URL o SUPABASE_KEY en .env")
+        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _sb_client
 
 
 def cargar_tiendas(sb: Client) -> dict[str, str]:
@@ -526,7 +535,54 @@ def insertar_producto(sb: Client, nombre: str, tienda_id: str) -> Optional[str]:
         return None
 
 
-def upsert_precio(sb: Client, producto_id: str, tienda_id: str, precio: float, ciudad: str):
+def buscar_producto_id(sb: Client, nombre: str) -> Optional[str]:
+    """Busca el ID de un producto por nombre exacto."""
+    try:
+        res = sb.table("productos").select("id").eq("nombre", nombre).limit(1).execute()
+        return res.data[0]["id"] if res.data else None
+    except Exception as e:
+        log.warning(f"Error buscando producto: {e}")
+        return None
+
+
+def buscar_tienda_id(sb: Client, nombre: str) -> Optional[str]:
+    """Busca el ID de una tienda por nombre."""
+    try:
+        res = sb.table("tiendas").select("id").eq("nombre", nombre).limit(1).execute()
+        return res.data[0]["id"] if res.data else None
+    except Exception as e:
+        log.warning(f"Error buscando tienda: {e}")
+        return None
+
+
+def tiene_ticket_reciente(sb: Client, producto_id: str, tienda_id: str, ciudad: str) -> bool:
+    """Verifica si existe un precio de tipo 'ticket' en los últimos DIAS_TICKET_RECIENTE días."""
+    try:
+        fecha_limite = (datetime.now() - timedelta(days=DIAS_TICKET_RECIENTE)).date().isoformat()
+        
+        result = sb.table('precies')\
+            .select('id')\
+            .eq('producto_id', producto_id)\
+            .eq('tienda_id', tienda_id)\
+            .eq('fuente', 'ticket')\
+            .gte('fecha', fecha_limite)\
+            .limit(1)\
+            .execute()
+        
+        return len(result.data) > 0
+    except Exception as e:
+        log.warning(f"⚠️ Error verificando ticket reciente: {e}")
+        return False
+
+
+def upsert_precio_protegido(sb: Client, producto_id: str, tienda_id: str, precio: float, ciudad: str, fuente: str = 'preciosdelsuper') -> bool:
+    """Inserta o actualiza el precio, respetando tickets recientes."""
+    
+    # Verificar si hay un ticket reciente
+    if tiene_ticket_reciente(sb, producto_id, tienda_id, ciudad):
+        log.info(f"⚠️ Saltando actualización: existe ticket reciente (últimos {DIAS_TICKET_RECIENTE} días)")
+        return False
+    
     try:
         sb.table("precios").upsert({
             "producto_id": producto_id,
@@ -534,10 +590,13 @@ def upsert_precio(sb: Client, producto_id: str, tienda_id: str, precio: float, c
             "ciudad": ciudad,
             "precio": precio,
             "fecha": str(date.today()),
-            "fuente": "scraper",
+            "fuente": fuente,
         }, on_conflict="producto_id,tienda_id,ciudad,fecha").execute()
+        log.info(f"✅ Precio actualizado: {precio}€ para producto {producto_id}")
+        return True
     except Exception as e:
         log.error(f"Error upsert precio: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,7 +643,8 @@ def limpiar_progreso():
 def main(page_inicio: int = 1, page_fin: Optional[int] = None, diagnostico: bool = False):
     inicio_ts = datetime.now()
     log.info("=" * 65)
-    log.info(f"🛒 Scraper preciosdelsuper.es v3 — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🛒 Scraper preciosdelsuper.es v4 — inicio: {inicio_ts:%Y-%m-%d %H:%M:%S}")
+    log.info(f"🔒 Protección de tickets: últimos {DIAS_TICKET_RECIENTE} días")
     log.info("=" * 65)
 
     # Conectar a Supabase
@@ -627,6 +687,7 @@ def main(page_inicio: int = 1, page_fin: Optional[int] = None, diagnostico: bool
         "sin_precio": stats_prev.get("sin_precio", 0),
         "errores_db": stats_prev.get("errores_db", 0),
         "paginas_vacias": stats_prev.get("paginas_vacias", 0),
+        "saltados_ticket": stats_prev.get("saltados_ticket", 0),
     }
 
     # Bucle principal
@@ -676,7 +737,11 @@ def main(page_inicio: int = 1, page_fin: Optional[int] = None, diagnostico: bool
                 })
                 stats["nuevos_prod"] += 1
 
-            upsert_precio(sb, producto_id, tienda_id, item["precio"], CIUDAD_SCRAPER)
+            # Subir precio con protección de tickets
+            exito = upsert_precio_protegido(sb, producto_id, tienda_id, item["precio"], CIUDAD_SCRAPER, 'preciosdelsuper')
+            if not exito:
+                stats["saltados_ticket"] += 1
+            
             random_sleep(SLEEP_PRODUCTO_MIN, SLEEP_PRODUCTO_MAX)
 
         # Guardar progreso después de cada página
@@ -692,6 +757,7 @@ def main(page_inicio: int = 1, page_fin: Optional[int] = None, diagnostico: bool
     log.info(f"   Productos procesados: {stats['procesados']}")
     log.info(f"   Precios actualizados: {stats['actualizados']}")
     log.info(f"   Productos nuevos: {stats['nuevos_prod']}")
+    log.info(f"   Saltados por ticket reciente: {stats['saltados_ticket']}")
     log.info("=" * 65)
 
     # Guardar resumen
