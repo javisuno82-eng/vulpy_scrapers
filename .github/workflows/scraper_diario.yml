@@ -1,23 +1,15 @@
 # .github/workflows/scraper_diario.yml
 # ─────────────────────────────────────────────────────────────────────────────
-# MEJORAS DE ROBUSTEZ INCLUIDAS:
-#   - FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 → elimina los avisos de Node.js 20
-#   - cache: "pip" con requirements.txt → instalación más rápida en sucesivas ejecuciones
-#   - continue-on-error + if: always() → el log se sube aunque el scraper falle
-#   - timeout-minutes por paso individual → evita bloqueos silenciosos
-#   - Separación de la instalación en dos pasos → más fácil de depurar si falla pip
-#   - Variables de entorno centralizadas a nivel de job → sin repetición
-#   - Paso de comprobación de secretos → avisa claro si faltan antes de ejecutar
-#   - Resumen al final de cada job → visible en la pestaña "Summary" de GitHub
-#   - Ejecución en serie: primero PreciosDelSuper, luego RadarSuper
+# SCRAPERS CADA 3 DÍAS (frecuencia optimizada)
 # ─────────────────────────────────────────────────────────────────────────────
 
-name: Scrapers Diarios Supermercados
+name: Scrapers Supermercados (Cada 3 días)
 
 on:
   schedule:
-    # Cada día a las 02:00 UTC (04:00 hora peninsular en verano)
-    - cron: "0 2 * * *"
+    # Cada 3 días a las 02:00 UTC
+    # Usando expresión cron: días 1,4,7,10,13,16,19,22,25,28,31
+    - cron: "0 2 1,4,7,10,13,16,19,22,25,28,31 * *"
 
   workflow_dispatch:
     inputs:
@@ -48,20 +40,15 @@ on:
           - "false"
           - "true"
 
-# ─── Variable global que elimina los avisos de depreciación de Node.js 20 ────
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 1 · PreciosDelSuper (PRIMERO)
-# ─────────────────────────────────────────────────────────────────────────────
 jobs:
   scraper-preciosdelsuper:
     name: "🏪 PreciosDelSuper (DIA, Alcampo, Consum…)"
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    # Solo se ejecuta si corresponde según el input (o en ejecución programada)
     if: >
       github.event_name == 'schedule' ||
       github.event.inputs.scraper == 'ambos' ||
@@ -131,18 +118,12 @@ jobs:
             echo "Consulta el log adjunto para más detalles." >> $GITHUB_STEP_SUMMARY
           fi
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 2 · RadarSuper (SEGUNDO - después de PreciosDelSuper)
-# ─────────────────────────────────────────────────────────────────────────────
   scraper-radarsuper:
     name: "🛒 RadarSuper (Mercadona + Carrefour)"
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
-    # Depende de que PreciosDelSuper haya terminado (si se ejecuta)
     needs: scraper-preciosdelsuper
 
-    # Solo se ejecuta si corresponde según el input (o en ejecución programada)
     if: >
       always() && (
         github.event_name == 'schedule' ||
